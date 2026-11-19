@@ -1,0 +1,19 @@
+# 用容器产出 Linux amd64 c-shared 插件（本机无 gcc 时使用）：
+#   docker build -f Dockerfile.build --output type=local,dest=bin/linux-amd64 .
+#
+# 只出 glibc 版：CPA 官方镜像基于 debian:bookworm（glibc）。
+# 不提供 musl/Alpine 版——Go c-shared 库在 musl 上 dlopen 不可用
+# （实测 Go 1.22 段错误、Go 1.26 报 initial-exec TLS 重定位错误）。
+
+ARG GO_VERSION=1.22
+
+FROM golang:${GO_VERSION}-bookworm AS build
+WORKDIR /src
+COPY go.mod ./
+COPY *.go ./
+# 锁定指令集基线，避免老 CPU / 虚拟机 SIGILL
+ENV CGO_ENABLED=1 GOAMD64=v1 CGO_CFLAGS="-march=x86-64 -O2"
+RUN go build -trimpath -buildmode=c-shared -ldflags "-s -w" -o /out/pggo-v1.0.0.so .
+
+FROM scratch
+COPY --from=build /out/pggo-v1.0.0.so /

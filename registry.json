@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "plugins": [
+    {
+      "id": "pggo",
+      "name": "PGGO Playground Executor",
+      "description": "Use a browser AI Studio page (driven by the Catiecli Playground Executor userscript) as a CLIProxyAPI executor, with an embedded WebSocket hub.",
+      "author": "in30mn1a",
+      "version": "1.0.0",
+      "repository": "https://github.com/in30mn1a/cpa-plugin-pggo",
+      "homepage": "https://github.com/in30mn1a/cpa-plugin-pggo",
+      "tags": ["Provider"],
+      "locales": {
+        "zh-CN": {
+          "description": "把浏览器里的 AI Studio 页面（Catiecli Playground Executor 用户脚本）当作 CPA 执行器，内嵌 WS 中枢。"
+        }
+      }
+    }
+  ]
+}

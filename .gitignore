@@ -1,0 +1,6 @@
+bin/
+dist/
+data/
+pggo-data/
+release/
+_loader_tmp.c

@@ -1,0 +1,12 @@
+{
+  "listen": "127.0.0.1:8788",
+  "script_path": "/opt/cliproxyapi/pggo/dist/Catiecli Playground Executor.user.js",
+  "data_dir": "/opt/cliproxyapi/pggo/data",
+  "api_keys": [],
+  "model_prefix": "pg-",
+  "models": ["gemini-3.8-flash", "gemini-3.6-flash", "gemini-2.5-pro", "gemini-2.5-flash"],
+  "model_map": {},
+  "timezone": "Asia/Shanghai",
+  "max_output_tokens": 65536,
+  "request_timeout_sec": 600
+}
