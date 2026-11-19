@@ -50,9 +50,19 @@ func ensureHub(c pluginConfig) {
 	defer hubMu.Unlock()
 	if theHub != nil {
 		theHub.mu.Lock()
-		theHub.cfg = c
+		sameAddr := theHub.cfg.Listen == c.Listen
+		if sameAddr {
+			theHub.cfg = c
+		}
 		theHub.mu.Unlock()
-		return
+		if sameAddr {
+			return
+		}
+		// 监听地址变了：先关旧端口再绑新端口（0.0.0.0 与 127.0.0.1 同端口会冲突）。
+		// 旧连接随之断开，页面脚本会自动重连到新地址（经反代时地址对外不变）。
+		logf("中枢监听地址变更 %s → %s，重绑中", theHub.cfg.Listen, c.Listen)
+		theHub.close()
+		theHub = nil
 	}
 	h := &hub{cfg: c, pending: make(map[string]*waiter)}
 	if err := h.start(); err != nil {
@@ -113,6 +123,23 @@ func (h *hub) close() {
 	}
 	if h.ln != nil {
 		_ = h.ln.Close()
+	}
+	// 已被劫持的 WS 连接不归 http.Server 管，需手动断开；1001 不在脚本的
+	// 「不重连」名单里，页面会自动重连。
+	h.mu.Lock()
+	conn := h.conn
+	h.conn = nil
+	rids := make([]string, 0, len(h.pending))
+	for rid := range h.pending {
+		rids = append(rids, rid)
+	}
+	h.mu.Unlock()
+	if conn != nil {
+		_ = conn.writeClose(1001, "hub restarting")
+		conn.shutdown()
+	}
+	for _, rid := range rids {
+		h.finish(rid, rpcErrf(http.StatusServiceUnavailable, "hub_restarting", "执行器中枢重启，请重试"))
 	}
 }
 
@@ -177,9 +204,12 @@ func (h *hub) dispatch(model string, wire []any, binding string) (string, error)
 	}
 }
 
+// finish 结束一个请求。先从 pending 摘除再关 done：页面重复发送 stream-end/error
+// 或结束后迟到的分块都会变成空操作，避免重复 close 触发 panic 拖垮宿主进程。
 func (h *hub) finish(rid string, err error) {
 	h.mu.Lock()
 	w := h.pending[rid]
+	delete(h.pending, rid)
 	h.mu.Unlock()
 	if w == nil {
 		return

@@ -450,3 +450,73 @@ func TestStreamResponseFieldNames(t *testing.T) {
 		t.Fatalf("字段名不匹配: %s", s)
 	}
 }
+
+// 面板保存后宿主下发的形态：数组字段可能是缩进或紧凑列表，空值键不能吞下一行。
+func TestApplyConfigPanelFields(t *testing.T) {
+	section := "enabled: true\npriority: 0\nlisten: 127.0.0.1:0\nscript_path:\ndata_dir: \"/data/pggo\"\napi-keys:\n- k-compact\nmodels:\n    - gemini-x\n    - gemini-y\n"
+	req, _ := json.Marshal(map[string]any{"config_yaml": []byte(section)})
+	t.Cleanup(shutdownHub)
+	applyConfig(req)
+	c := currentConfig()
+	if c.Listen != "127.0.0.1:0" || c.DataDir != "/data/pggo" || c.ScriptPath != "" {
+		t.Fatalf("标量字段解析错误: listen=%q data=%q script=%q", c.Listen, c.DataDir, c.ScriptPath)
+	}
+	if len(c.APIKeys) != 1 || c.APIKeys[0] != "k-compact" {
+		t.Fatalf("紧凑列表 api-keys 解析错误: %v", c.APIKeys)
+	}
+	if len(c.Models) != 2 || c.Models[1] != "gemini-y" {
+		t.Fatalf("models 解析错误: %v", c.Models)
+	}
+}
+
+// listen 变更时中枢应关旧端口、绑新端口，并断开旧 WS 连接。
+func TestEnsureHubRebindsOnListenChange(t *testing.T) {
+	t.Cleanup(shutdownHub)
+	shutdownHub()
+	c := defaultConfig()
+	c.Listen = "127.0.0.1:0"
+	c.APIKeys = []string{"cat-test"}
+	ensureHub(c)
+	old := activeHub()
+	if old == nil {
+		t.Fatal("中枢未启动")
+	}
+	oldAddr := old.ln.Addr().String()
+	ws := dialTestWS(t, oldAddr, "/api/pg/ws")
+	if err := ws.sendText(`{"type":"register","apiKey":"cat-test"}`); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := ws.readFrame(); err != nil { // registered
+		t.Fatal(err)
+	}
+
+	c2 := c
+	c2.Listen = "127.0.0.1:0" // 同字面值不重绑
+	ensureHub(c2)
+	if activeHub() != old {
+		t.Fatal("监听地址未变却重建了中枢")
+	}
+
+	c3 := c
+	c3.Listen = "localhost:0"
+	ensureHub(c3)
+	nh := activeHub()
+	if nh == nil || nh == old {
+		t.Fatal("监听地址变更后未重建中枢")
+	}
+	op, payload, err := ws.readFrame()
+	if err != nil || op != 0x8 || len(payload) < 2 || binary.BigEndian.Uint16(payload) != 1001 {
+		t.Fatalf("旧连接应收到 1001 关闭帧: op=%x payload=%v err=%v", op, payload, err)
+	}
+	if _, err := net.DialTimeout("tcp", oldAddr, time.Second); err == nil {
+		t.Fatal("旧端口仍在监听")
+	}
+}
+
+// 页面重复发送 stream-end 不得触发重复 close panic。
+func TestFinishTwiceIsNoop(t *testing.T) {
+	h := &hub{pending: map[string]*waiter{"r1": {done: make(chan struct{})}}}
+	h.finish("r1", nil)
+	h.finish("r1", nil)
+	h.appendChunk("r1", "late")
+}

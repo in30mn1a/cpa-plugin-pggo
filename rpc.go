@@ -107,9 +107,22 @@ func applyConfig(request []byte) {
 		if keys := yamlListBlock(yamlText, "api-keys"); len(keys) > 0 {
 			next.APIKeys = append(append([]string{}, next.APIKeys...), keys...)
 		}
+		// 面板字段（plugins.configs.pggo.*）非空时覆盖 JSON 配置
+		for key, dst := range map[string]*string{
+			"listen":      &next.Listen,
+			"script_path": &next.ScriptPath,
+			"data_dir":    &next.DataDir,
+		} {
+			if v := yamlScalar(yamlText, key); v != "" {
+				*dst = v
+			}
+		}
+		if models := yamlListBlock(yamlText, "models"); len(models) > 0 {
+			next.Models = models
+		}
 	}
 	if len(next.APIKeys) == 0 {
-		logf("未配置任何执行器 Key：页面 register 将全部被 4008 拒绝（请在 plugins.configs.pggo.api-keys 或 JSON api_keys 中填写）")
+		logf("未配置任何执行器 Key：页面 register 将全部被 4008 拒绝（请在插件配置的 api-keys 中填写）")
 	}
 	cfgMu.Lock()
 	cfg = next
@@ -132,7 +145,8 @@ func loadConfigFile(path string) (pluginConfig, error) {
 
 // yamlScalar 从整份 YAML 文本里捞一个标量键（够用即止，不引入 YAML 依赖）。
 func yamlScalar(yamlText, key string) string {
-	re := regexp.MustCompile(`(?m)^\s*` + regexp.QuoteMeta(key) + `\s*:\s*("([^"]*)"|'([^']*)'|([^\s#]+))`)
+	// 只在同一行内匹配，避免空值键（`listen:`）吞掉下一行的内容
+	re := regexp.MustCompile(`(?m)^[ \t]*` + regexp.QuoteMeta(key) + `[ \t]*:[ \t]*("([^"]*)"|'([^']*)'|([^\s#]+))`)
 	m := re.FindStringSubmatch(yamlText)
 	if m == nil {
 		return ""
@@ -173,11 +187,9 @@ func yamlListBlock(yamlText, key string) []string {
 			if strings.TrimSpace(sub) == "" {
 				continue
 			}
-			if countIndent(sub) <= indent {
-				break
-			}
 			item := strings.TrimSpace(sub)
-			if !strings.HasPrefix(item, "-") {
+			// 兼容紧凑写法：列表项可与父键同缩进（`key:\n- a`）
+			if countIndent(sub) < indent || !strings.HasPrefix(item, "-") {
 				break
 			}
 			item = strings.Trim(strings.TrimSpace(strings.TrimPrefix(item, "-")), `"'`)
@@ -208,7 +220,7 @@ func countIndent(s string) int {
 
 // ------------------------------------------------------------ 注册元数据 ----
 
-const pluginVersion = "1.0.0"
+const pluginVersion = "1.0.1"
 
 type configField struct {
 	Name        string   `json:"Name"`
@@ -247,10 +259,15 @@ func registrationPayload() registration {
 		Metadata: metadata{
 			Name:             "pggo",
 			Version:          pluginVersion,
-			Author:           "self-hosted",
+			Author:           "in30mn1a",
 			GitHubRepository: "https://github.com/in30mn1a/cpa-plugin-pggo",
 			ConfigFields: []configField{
-				{Name: "config_file", Type: "string", Default: "pggo.json", Description: "本插件 JSON 配置文件路径（listen/script_path/models 等）"},
+				{Name: "api-keys", Type: "array", Description: "页面执行器 register 用的 Key（脚本面板里填的那个）；建议与 CPA 顶层 api-keys 相同。必填"},
+				{Name: "listen", Type: "string", Default: "127.0.0.1:8788", Description: "内嵌中枢监听地址；CPA 跑在 Docker 里需改为 0.0.0.0:8788 并映射端口。修改后自动重绑"},
+				{Name: "script_path", Type: "string", Description: "用户脚本文件路径（供 /api/pg/script.user.js 分发）；不填则不提供脚本分发"},
+				{Name: "data_dir", Type: "string", Default: "pggo-data", Description: "Cookie 推送 / Robin 绑定的落盘目录"},
+				{Name: "models", Type: "array", Description: "上游模型 ID 列表，注册为 pg-<ID>；不填使用内置默认列表"},
+				{Name: "config_file", Type: "string", Description: "可选：JSON 配置文件路径（高级项 model_map/timezone 等）；面板字段非空时优先"},
 			},
 		},
 		Capabilities: capabilities{

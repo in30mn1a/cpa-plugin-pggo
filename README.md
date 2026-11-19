@@ -42,29 +42,29 @@ wire 编解码按 [AI Studio 私有协议](https://github.com/Mag1cFall/AIStudio
 ```bash
 # Linux（CPA 主机上，需 gcc + Go 1.22+）
 cd cpa-plugin-pggo
-make build            # 产出 bin/pggo-v1.0.0.so
+make build            # 产出 bin/pggo-v1.0.1.so
 # 或直接
-CGO_ENABLED=1 go build -trimpath -buildmode=c-shared -ldflags "-s -w" -o pggo-v1.0.0.so .
+CGO_ENABLED=1 go build -trimpath -buildmode=c-shared -ldflags "-s -w" -o pggo-v1.0.1.so .
 ```
 
 Windows（装了 MinGW-w64 的机器）：
 
 ```powershell
-$env:CGO_ENABLED=1; go build -trimpath -buildmode=c-shared -ldflags "-s -w" -o pggo-v1.0.0.dll .
+$env:CGO_ENABLED=1; go build -trimpath -buildmode=c-shared -ldflags "-s -w" -o pggo-v1.0.1.dll .
 ```
 
 **没有 gcc？用 Docker 出 Linux 版**（`Dockerfile.build`，已锁 `GOAMD64=v1`）：
 
 ```bash
 docker build -f Dockerfile.build --output type=local,dest=bin/linux-amd64 .
-# 产出 bin/linux-amd64/pggo-v1.0.0.so
+# 产出 bin/linux-amd64/pggo.so
 ```
 
 产物是 glibc 版，适配 CPA 官方镜像（`debian:bookworm`）和 Debian/Ubuntu 主机。
 **不支持 Alpine/musl 环境**：Go c-shared 库在 musl 上无法被 dlopen（实测段错误 / TLS 重定位错误）。
 可在 CPA 容器里 `ldd --version 2>&1 | head -1` 确认，输出含 `GLIBC` 即可用。
 
-> 插件文件名就是插件 ID：`pggo-v1.0.0.so` → ID `pggo`、版本 `1.0.0`。
+> 插件目录下的文件名决定 ID 与版本：`pggo-v1.0.1.so` → ID `pggo`、版本 `1.0.1`。
 > CI 交叉编译时记得锁指令集基线：`GOAMD64=v1 CGO_CFLAGS="-march=x86-64"`，否则老 CPU 上会 SIGILL。
 
 ## 安装
@@ -80,53 +80,46 @@ plugins:
     - "https://raw.githubusercontent.com/in30mn1a/cpa-plugin-pggo/main/registry.json"
 ```
 
-商店会从本仓库 Release 下载 `pggo_<版本>_linux_amd64.zip` 并用 `checksums.txt` 校验。装完仍需按下文在 `plugins.configs.pggo` 里填 `config_file` 与 `api-keys`，并准备 `pggo.json` 与用户脚本。
+商店会从本仓库 Release 下载 `pggo_<版本>_linux_amd64.zip` 并用 `checksums.txt` 校验。
 
 ### 方式二：手动放文件
 
 ```bash
 # CPA 的 plugins 目录（config.yaml 里的 plugins.dir，默认 ./plugins）
 mkdir -p plugins/linux/amd64
-cp bin/pggo-v1.0.0.so plugins/linux/amd64/
+cp bin/linux-amd64/pggo.so plugins/linux/amd64/pggo-v1.0.1.so
 ```
 
-`config.yaml`：
+## 配置
+
+装好后在 CPA 管理面板「插件 → pggo → 配置」里直接填（≥ v1.0.1），保存即生效：
+
+| 字段 | 说明 |
+|---|---|
+| `api-keys` | **必填**。页面执行器 register 用的 Key，即脚本面板里填的那个；建议与 CPA 顶层 `api-keys` 相同 |
+| `listen` | 内嵌中枢监听地址，默认 `127.0.0.1:8788`。**CPA 跑在 Docker 里要改成 `0.0.0.0:8788` 并映射端口**，否则反代连不进容器。修改后自动重绑 |
+| `script_path` | 用户脚本文件路径（容器内路径，需挂载），供 `/api/pg/script.user.js` 分发；不填就不提供分发 |
+| `data_dir` | Cookie 推送 / Robin 绑定落盘目录，默认 `pggo-data` |
+| `models` | 上游模型 ID 列表，注册成 `pg-<ID>`；不填用内置默认列表。**上游 ID 必须真实存在**（插件不做 ListModels 探测） |
+| `config_file` | 可选。JSON 配置文件（模板 `config.example.json`），用于 `model_map` / `timezone` / `max_output_tokens` / `request_timeout_sec` 等高级项；面板字段非空时优先 |
+
+等价的 `config.yaml` 写法：
 
 ```yaml
 plugins:
   enabled: true
-  dir: plugins
   configs:
     pggo:
       enabled: true
-      priority: 1
-      config_file: /opt/cliproxyapi/pggo/pggo.json   # 插件自己的 JSON 配置
-      api-keys:                                      # 页面执行器 register 用的 Key
+      api-keys:
         - "<与 CPA 顶层 api-keys 相同的值>"
+      listen: "0.0.0.0:8788"
+      script_path: "/CLIProxyAPI/pggo/Catiecli Playground Executor.user.js"
+      data_dir: "/CLIProxyAPI/pggo/data"
 ```
 
-> ⚠ CPA 只把 `plugins.configs.pggo` **这一节**下发给插件（不含顶层 `api-keys`），
-> 所以执行器 Key 必须在本节或 JSON 里显式填写；两处都没填时，页面 register 会全部被 `4008` 拒绝，CPA 日志里会有提示。
-
-`pggo.json`（模板见 `config.example.json`）：
-
-```json
-{
-  "listen": "127.0.0.1:8788",
-  "script_path": "/opt/cliproxyapi/pggo/dist/Catiecli Playground Executor.user.js",
-  "data_dir": "/opt/cliproxyapi/pggo/data",
-  "api_keys": [],
-  "model_prefix": "pg-",
-  "models": ["gemini-3.8-flash", "gemini-3.6-flash", "gemini-2.5-pro", "gemini-2.5-flash"],
-  "timezone": "Asia/Shanghai",
-  "max_output_tokens": 65536,
-  "request_timeout_sec": 600
-}
-```
-
-- `models` 里的名字会注册成 `pg-` + 名字，**上游模型 ID 必须真实存在**（插件不做 ListModels 探测）。
-- `model_map` 可把 CPA 侧模型名硬映射到上游 ID（例如 `{"pg-fast":"gemini-3.6-flash"}`）。
-- `api_keys` 与 YAML 节里的 `api-keys` 合并生效，任填一处即可。
+> ⚠ CPA 只把 `plugins.configs.pggo` **这一节**下发给插件，**不会继承顶层 `api-keys`**。
+> 本节和 JSON 都没有 Key 时，页面 register 会全部被 `4008` 拒绝，CPA 日志里会有提示。
 
 ## 脚本 & 反代
 
