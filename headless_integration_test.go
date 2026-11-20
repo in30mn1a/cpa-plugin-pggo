@@ -166,4 +166,10 @@ func TestHeadlessWorkerIntegration(t *testing.T) {
 		time.Sleep(time.Second)
 	}
 	t.Log("重新推送 Cookie 后 headless 已重新注册")
+
+	// 可选：保持中枢在线一段时间，便于手动重启 worker 验证状态文件复用等行为
+	if hold, _ := time.ParseDuration(os.Getenv("PGGO_HEADLESS_IT_HOLD")); hold > 0 {
+		t.Logf("保持中枢在线 %s", hold)
+		time.Sleep(hold)
+	}
 }

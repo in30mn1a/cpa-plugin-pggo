@@ -17,9 +17,15 @@ RUN npm ci --omit=dev \
 
 COPY src ./src
 
-# 非 root 运行；/tmp/.X11-unix 供 Xvfb 使用
-RUN useradd -m -u 10001 pggo && mkdir -p /tmp/.X11-unix && chmod 1777 /tmp/.X11-unix
-USER pggo
+# 非 root 运行（Playwright 下 Chromium 带 --no-sandbox，必须避免 root）。
+# 主组为 0：中枢把 Cookie 推送写成 root:root 0640，只读挂载后同组可读。
+# /state 存轮换后的 Cookie（挂载命名卷时 Docker 会沿用这里的属主与权限）。
+# /tmp/.X11-unix 供 Xvfb 使用。
+RUN useradd -m -u 10001 -g 0 pggo \
+ && mkdir -p /state /tmp/.X11-unix \
+ && chown 10001:0 /state && chmod 0700 /state \
+ && chmod 1777 /tmp/.X11-unix
+USER 10001:0
 
 ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["node", "src/worker.js"]

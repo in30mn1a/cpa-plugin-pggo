@@ -62,7 +62,8 @@ function selectCookieFile({ dir, file, label }) {
             }) || null;
     }
     candidates.sort((a, b) => b.mtimeMs - a.mtimeMs);
-    return candidates[0] || null;
+    if (!candidates[0]) return null;
+    return { ...candidates[0], total: candidates.length };
 }
 
 // Chrome 扩展 / GM_cookie 的 sameSite → Playwright。
@@ -143,6 +144,15 @@ function sanitizeUA(ua) {
     return String(ua || "").replace(/HeadlessChrome/g, "Chrome").trim();
 }
 
+// 保留推送 UA 的平台/OS 部分，但把 Chrome 版本换成实际 Chromium 的大版本
+// （Chrome 的精简 UA 形如 Chrome/156.0.0.0）。否则 UA 宣称的版本与内核实际
+// 支持的 Web API/行为不一致，本身就是可识别的特征。
+function alignUAVersion(ua, browserVersion) {
+    const major = String(browserVersion || "").split(".")[0];
+    if (!/^\d+$/.test(major)) return ua;
+    return String(ua).replace(/Chrome\/[\d.]+/, `Chrome/${major}.0.0.0`);
+}
+
 function num(v, lo, hi) {
     return typeof v === "number" && isFinite(v) && v >= lo && v <= hi ? v : null;
 }
@@ -173,11 +183,13 @@ function contextOptions(fp, { userAgent, defaultTimezone = "UTC", defaultLocale 
 
 // 从 UA 推导 UA-CH 元数据（navigator.userAgentData / Sec-CH-UA*），避免
 // 只覆盖 UA 字符串导致 userAgentData 与 UA 不一致。
-function uaMetadata(ua, fp) {
+// fullVersion 传实际 Chromium 版本（如 156.0.8078.4），保证 UA-CH 与真实内核一致。
+function uaMetadata(ua, fp, fullVersion) {
     const m = /Chrome\/(\d+)(?:\.(\d+)\.(\d+)\.(\d+))?/.exec(ua || "");
     if (!m) return null;
     const major = m[1];
-    const full = m[2] ? `${m[1]}.${m[2]}.${m[3]}.${m[4]}` : `${major}.0.0.0`;
+    let full = m[2] ? `${m[1]}.${m[2]}.${m[3]}.${m[4]}` : `${major}.0.0.0`;
+    if (fullVersion && String(fullVersion).split(".")[0] === major) full = String(fullVersion);
     let platform = "Linux";
     let platformVersion = "";
     let navPlatform = "Linux x86_64";
@@ -221,9 +233,12 @@ function uaMetadata(ua, fp) {
 }
 
 // 把 WS 地址补上 channel=headless（已有 channel 参数则保持）。
+// 强制 channel=headless（覆盖任何其它 channel 值）：worker 绝不能注册到 page 通道，
+// 否则会用 4001 顶掉真实浏览器。
 function normalizeWsUrl(raw) {
     const u = new URL(raw);
-    if (!u.searchParams.has("channel")) u.searchParams.set("channel", "headless");
+    u.searchParams.delete("channel");
+    u.searchParams.set("channel", "headless");
     return u.toString();
 }
 
@@ -268,6 +283,47 @@ ${patched}
 })();`;
 }
 
+// ------------------------------------------------------------- 状态持久化 ----
+// Google 会在运行中轮换 Cookie（__Secure-*PSIDTS 等），轮换后的值只在浏览器内存里。
+// worker 定期把 Cookie 罐存到可写卷，重启时若状态文件派生自「同一份推送」就优先用它；
+// 浏览器重新推送（推送文件 mtime 变化）后旧状态自动作废。
+
+function stateFileFor(stateDir, push, pushFile) {
+    const label = push.email || path.basename(pushFile, ".json");
+    return path.join(stateDir, sanitizeLabel(label) + ".state.json");
+}
+
+// 返回可用的 Cookie 列表或 null。条件：同一账号、派生自同一份推送（sourceMtimeMs 相同）、
+// 且保存时间晚于推送。
+function loadState(file, push, pushMtimeMs, nowSec = Date.now() / 1000) {
+    let st;
+    try {
+        st = JSON.parse(fs.readFileSync(file, "utf8"));
+    } catch (_) {
+        return null;
+    }
+    if (!st || !Array.isArray(st.cookies)) return null;
+    if (String(st.email || "") !== String(push.email || "")) return null;
+    if (st.sourceMtimeMs !== pushMtimeMs || !(st.savedAt > pushMtimeMs)) return null;
+    const cookies = st.cookies.filter((c) => c && typeof c.name === "string" && typeof c.value === "string" &&
+        isGoogleDomain(c.domain) && !(c.expires > 0 && c.expires < nowSec));
+    return cookies.length ? cookies : null;
+}
+
+function saveState(file, { email, pushMtimeMs, cookies }) {
+    const dir = path.dirname(file);
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const tmp = path.join(dir, `.${path.basename(file)}.tmp-${process.pid}`);
+    const body = JSON.stringify({
+        email: email || "",
+        sourceMtimeMs: pushMtimeMs,
+        savedAt: Date.now(),
+        cookies: cookies.filter((c) => isGoogleDomain(c.domain)),
+    });
+    fs.writeFileSync(tmp, body, { mode: 0o600 });
+    fs.renameSync(tmp, file);
+}
+
 module.exports = {
     REQUIRED_COOKIES,
     sanitizeLabel,
@@ -277,6 +333,10 @@ module.exports = {
     loadCookiePush,
     startUrl,
     sanitizeUA,
+    alignUAVersion,
+    stateFileFor,
+    loadState,
+    saveState,
     contextOptions,
     uaMetadata,
     normalizeWsUrl,

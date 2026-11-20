@@ -173,3 +173,50 @@ test("buildInitScript：真实用户脚本可改写并通过语法检查", () =>
     new vm.Script(src); // 语法检查
     assert.throws(() => lib.buildInitScript("no ws here", { wsUrl: "ws://x", apiKey: "k" }), /WS_URL/);
 });
+
+test("normalizeWsUrl 强制 channel=headless", () => {
+    assert.strictEqual(lib.normalizeWsUrl("ws://h/api/pg/ws?channel=page"), "ws://h/api/pg/ws?channel=headless");
+    assert.strictEqual(lib.normalizeWsUrl("ws://h/api/pg/ws?channel=page&channel=x&a=1"), "ws://h/api/pg/ws?a=1&channel=headless");
+});
+
+test("alignUAVersion 保留平台、对齐实际 Chromium 大版本；UA-CH 用实际完整版本", () => {
+    const pushed = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.7390.55 Safari/537.36";
+    const ua = lib.alignUAVersion(pushed, "156.0.8078.4");
+    assert.strictEqual(ua, "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36");
+    const meta = lib.uaMetadata(ua, null, "156.0.8078.4");
+    assert.strictEqual(meta.userAgentMetadata.platform, "Windows");
+    assert.strictEqual(meta.userAgentMetadata.fullVersion, "156.0.8078.4");
+    assert.ok(meta.userAgentMetadata.brands.every((b) => b.brand === "Not_A Brand" || b.version === "156"));
+    assert.strictEqual(lib.alignUAVersion(pushed, ""), pushed);
+});
+
+test("selectCookieFile 返回目录内文件总数（用于多账号告警）", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pggo-ck-"));
+    fs.writeFileSync(path.join(dir, "a.json"), "{}");
+    fs.writeFileSync(path.join(dir, "b.json"), "{}");
+    fs.writeFileSync(path.join(dir, ".b.json.tmp-1"), "{}"); // 中枢原子写的临时文件不计入
+    assert.strictEqual(lib.selectCookieFile({ dir }).total, 2);
+});
+
+test("状态文件：同账号且派生自同一份推送才使用；新推送使其作废", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pggo-st-"));
+    const push = { email: "a@gmail.com" };
+    const file = lib.stateFileFor(dir, push, "/x/a@gmail.com.json");
+    assert.strictEqual(path.basename(file), "a@gmail.com.state.json");
+    const pushMtimeMs = Date.now() - 5000;
+    lib.saveState(file, {
+        email: "a@gmail.com",
+        pushMtimeMs,
+        cookies: [
+            { name: "__Secure-1PSIDTS", value: "rotated", domain: ".google.com", path: "/", expires: -1, httpOnly: true, secure: true, sameSite: "None" },
+            { name: "X", value: "y", domain: ".example.com", path: "/", expires: -1 },
+        ],
+    });
+    const got = lib.loadState(file, push, pushMtimeMs);
+    assert.strictEqual(got.length, 1);
+    assert.strictEqual(got[0].value, "rotated");
+    assert.strictEqual(lib.loadState(file, push, pushMtimeMs + 1), null, "新推送（mtime 变化）应使状态作废");
+    assert.strictEqual(lib.loadState(file, { email: "b@gmail.com" }, pushMtimeMs), null, "不同账号不能用");
+    assert.strictEqual(lib.loadState(path.join(dir, "missing.json"), push, pushMtimeMs), null);
+    assert.deepStrictEqual(fs.readdirSync(dir), ["a@gmail.com.state.json"], "不应残留临时文件");
+});

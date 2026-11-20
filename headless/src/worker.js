@@ -42,6 +42,9 @@ function readEnv(env = process.env) {
         recycleMs: envInt("PGGO_RECYCLE_HOURS", 6) * 3600 * 1000,
         pageLog: env.PGGO_PAGE_LOG !== "0",
         cookiePollMs: envInt("PGGO_COOKIE_POLL_SEC", 10) * 1000,
+        stateDir: env.PGGO_STATE_DIR === undefined ? "/state" : env.PGGO_STATE_DIR,
+        stateSaveMs: envInt("PGGO_STATE_SAVE_MIN", 10) * 60 * 1000,
+        drainMs: envInt("PGGO_DRAIN_SEC", 60) * 1000,
     };
 }
 
@@ -159,7 +162,7 @@ async function nativeUserAgent(browser) {
 }
 
 // 页面级 CDP 覆盖：UA-CH 元数据（让 userAgentData 与 UA 字符串一致）+ CPU 核数。
-async function applyPageOverrides(page, ua, fp, locale) {
+async function applyPageOverrides(page, ua, fp, locale, fullVersion) {
     let cdp;
     try {
         cdp = await page.context().newCDPSession(page);
@@ -167,7 +170,7 @@ async function applyPageOverrides(page, ua, fp, locale) {
         log("CDP 会话创建失败（跳过 UA-CH 覆盖）: " + e.message);
         return;
     }
-    const meta = lib.uaMetadata(ua, fp);
+    const meta = lib.uaMetadata(ua, fp, fullVersion);
     if (meta) {
         try {
             await cdp.send("Emulation.setUserAgentOverride", {
@@ -203,15 +206,27 @@ class Session {
         this.inflight = new Set();
         this.crashed = false;
         this.stopped = false;
+        this.loginRedirect = ""; // 非空 = 被重定向到的主机（Cookie 失效）
     }
 
     async run(selected, isStopping) {
         const cfg = this.cfg;
         const push = lib.loadCookiePush(selected.file);
         const tag = push.email || path.basename(selected.file);
+        this.push = push;
+        this.pushMtimeMs = selected.mtimeMs;
         log(`Cookie: ${tag}（${push.cookies.length} 条，丢弃 ${push.dropped}，authuser=${push.authuser}）`);
         if (push.missing.length) log(`⚠ 缺少会话必需 Cookie: ${push.missing.join(", ")}（Google 可能判 401）`);
         if (!push.cookies.length) throw new Error("推送文件里没有可用 Cookie");
+        let cookies = push.cookies;
+        if (cfg.stateDir) {
+            this.stateFile = lib.stateFileFor(cfg.stateDir, push, selected.file);
+            const saved = lib.loadState(this.stateFile, push, selected.mtimeMs);
+            if (saved) {
+                cookies = saved;
+                log(`使用已保存的轮换 Cookie（${saved.length} 条，派生自同一份推送）`);
+            }
+        }
 
         const script = fs.readFileSync(cfg.scriptPath, "utf8");
         const initScript = lib.buildInitScript(script, { wsUrl: this.wsPageUrl, apiKey: cfg.apiKey });
@@ -223,7 +238,9 @@ class Session {
         }
         this.browser = await launchBrowser(this.chromium, baseOpts, cfg.mode, this.xvfb && this.xvfb.display);
         this.browser.on("disconnected", () => { this.browserGone = true; });
-        const ua = lib.sanitizeUA((fp && fp.userAgent) || (await nativeUserAgent(this.browser)));
+        this.browserVersion = this.browser.version();
+        // 保留推送 UA 的平台信息，版本号对齐实际 Chromium
+        const ua = lib.alignUAVersion(lib.sanitizeUA((fp && fp.userAgent) || (await nativeUserAgent(this.browser))), this.browserVersion);
         const ctxOpts = lib.contextOptions(fp, { userAgent: ua, defaultTimezone: cfg.defaultTimezone });
         log(`浏览器 ${this.browser.version()}（${cfg.mode}）视口 ${ctxOpts.viewport.width}x${ctxOpts.viewport.height} 屏幕 ${ctxOpts.screen.width}x${ctxOpts.screen.height} ${ctxOpts.locale} ${ctxOpts.timezoneId}`);
 
@@ -236,7 +253,7 @@ class Session {
             log("授予 local-network-access 失败（旧版 Chromium 可忽略）: " + e.message.split("\n")[0]);
         }
         if (this.extra.setupContext) await this.extra.setupContext(this.context);
-        await this.context.addCookies(push.cookies);
+        await this.context.addCookies(cookies);
         await this.context.addInitScript({ content: initScript });
         this.ua = ua;
         this.fp = fp;
@@ -248,10 +265,15 @@ class Session {
         let waitSince = Date.now();
         let pageLoadedAt = Date.now();
         let lastCookieCheck = Date.now();
+        let lastStateSave = 0;
 
         while (!isStopping()) {
             await sleep(1000);
             if (this.browserGone) throw new Error("浏览器进程已退出");
+            if (this.loginRedirect) {
+                // Cookie 已失效：重载只会反复撞 Google 登录页，交给主循环等新推送
+                return "cookies-invalid";
+            }
             if (this.crashed || this.page.isClosed()) {
                 log("⚠ 页面崩溃/关闭，重建页面");
                 await this.openPage();
@@ -264,12 +286,17 @@ class Session {
                 const cur = lib.selectCookieFile({ dir: cfg.cookieDir, file: cfg.cookieFile, label: cfg.cookieLabel });
                 if (cur && (cur.file !== selected.file || cur.mtimeMs !== selected.mtimeMs)) {
                     log(`Cookie 文件已更新（${path.basename(cur.file)}），重启会话`);
+                    await this.drain(isStopping);
                     return "cookie-changed";
                 }
             }
             if (this.registered) {
                 reloads = 0;
                 waitSince = now;
+                if (this.stateFile && now - lastStateSave >= cfg.stateSaveMs) {
+                    lastStateSave = now;
+                    await this.saveState();
+                }
                 if (cfg.recycleMs > 0 && now - pageLoadedAt > cfg.recycleMs && this.inflight.size === 0) {
                     log(`页面已运行 ${Math.round((now - pageLoadedAt) / 3600000)}h 且空闲，定期重载以回收内存`);
                     await this.reload();
@@ -293,6 +320,35 @@ class Session {
         return "stopped";
     }
 
+    // 等进行中的请求结束（有上限），再重启会话，避免把正在流式返回的请求截断。
+    async drain(isStopping) {
+        const deadline = Date.now() + this.cfg.drainMs;
+        if (this.inflight.size) log(`等待 ${this.inflight.size} 个进行中的请求结束（最多 ${Math.round(this.cfg.drainMs / 1000)}s）…`);
+        while (this.inflight.size && Date.now() < deadline && !isStopping()) await sleep(500);
+        if (this.inflight.size) log(`⚠ 仍有 ${this.inflight.size} 个请求未结束，强制重启`);
+    }
+
+    // 把当前 Cookie 罐（含 Google 轮换后的值）存到状态卷；Cookie 失效时不存。
+    async saveState() {
+        if (!this.stateFile || !this.context || !this.everRegistered || this.loginRedirect || this.stateDisabled) return;
+        try {
+            const cookies = await this.context.cookies();
+            lib.saveState(this.stateFile, { email: this.push.email, pushMtimeMs: this.pushMtimeMs, cookies });
+        } catch (e) {
+            this.stateDisabled = true;
+            log(`⚠ 保存 Cookie 状态失败，本会话不再尝试（检查 PGGO_STATE_DIR 是否可写）: ${e.message.split("\n")[0]}`);
+        }
+    }
+
+    markRedirect(rawUrl) {
+        let host = "";
+        try { host = new URL(rawUrl).hostname; } catch (_) { return; }
+        if (!host || host === "aistudio.google.com" || this.loginRedirect) return;
+        if (!/(^|\.)google\.com$/.test(host)) return; // about:blank 等不算
+        this.loginRedirect = host;
+        log(`❌ 页面被重定向到 ${host}：Cookie 已失效或账号需重新验证。请在真实浏览器登录后重新推送 Cookie；在此之前不再访问 Google`);
+    }
+
     async openPage() {
         if (this.page && !this.page.isClosed()) await this.page.close().catch(() => {});
         this.crashed = false;
@@ -303,7 +359,10 @@ class Session {
         page.on("crash", () => { this.crashed = true; });
         page.on("websocket", (ws) => this.watchWs(ws));
         page.on("console", (m) => this.onConsole(m));
-        await applyPageOverrides(page, this.ua, this.fp, this.locale);
+        page.on("framenavigated", (frame) => {
+            if (frame === page.mainFrame()) this.markRedirect(frame.url());
+        });
+        await applyPageOverrides(page, this.ua, this.fp, this.locale, this.browserVersion);
         await this.goto();
     }
 
@@ -315,10 +374,7 @@ class Session {
             log("⚠ 页面加载失败: " + e.message.split("\n")[0]);
             return;
         }
-        const host = new URL(this.page.url()).hostname;
-        if (host !== "aistudio.google.com") {
-            log(`⚠ 被重定向到 ${host}（Cookie 失效或账号受限？需在浏览器重新推送 Cookie）`);
-        }
+        this.markRedirect(this.page.url());
     }
 
     async reload() {
@@ -328,7 +384,9 @@ class Session {
             await this.page.goto(this.url, { waitUntil: "domcontentloaded", timeout: 90000 });
         } catch (e) {
             log("⚠ 重载失败: " + e.message.split("\n")[0]);
+            return;
         }
+        this.markRedirect(this.page.url());
     }
 
     watchWs(ws) {
@@ -379,10 +437,16 @@ class Session {
         if (this.cfg.pageLog) log("page: " + text.slice(10, 300));
     }
 
-    async close() {
-        this.stopped = true;
-        try { if (this.browser) await this.browser.close(); } catch (_) {}
-        if (this.xvfb) this.xvfb.stop();
+    close() {
+        if (!this.closing) {
+            this.closing = (async () => {
+                this.stopped = true;
+                await this.saveState();
+                try { if (this.browser) await this.browser.close(); } catch (_) {}
+                if (this.xvfb) this.xvfb.stop();
+            })();
+        }
+        return this.closing;
     }
 }
 
@@ -393,6 +457,7 @@ async function runWorker(cfg, { chromium, extra, isStopping, onSession } = {}) {
     const fwd = await startForwarder(cfg.wsUrl);
     log(`启动：模式 ${cfg.mode}，中枢 ${redactUrl(cfg.wsUrl)}，Cookie 目录 ${cfg.cookieDir}`);
     let backoff = 5000;
+    let warnedFile = "";
     try {
         while (!isStopping()) {
             const selected = lib.selectCookieFile({ dir: cfg.cookieDir, file: cfg.cookieFile, label: cfg.cookieLabel });
@@ -401,9 +466,12 @@ async function runWorker(cfg, { chromium, extra, isStopping, onSession } = {}) {
                 await sleepUntil(30000, isStopping);
                 continue;
             }
+            if (selected.total > 1 && warnedFile !== selected.file) {
+                warnedFile = selected.file;
+                log(`⚠ 未设置 PGGO_COOKIE_LABEL，目录里有 ${selected.total} 个账号文件，使用最新的: ${path.basename(selected.file, ".json")}（建议显式设置 PGGO_COOKIE_LABEL）`);
+            }
             const session = new Session(cfg, chromium, fwd.pageUrl, extra);
             if (onSession) onSession(session);
-            const startedAt = Date.now();
             let reason;
             try {
                 reason = await session.run(selected, isStopping);
@@ -418,13 +486,32 @@ async function runWorker(cfg, { chromium, extra, isStopping, onSession } = {}) {
                 backoff = 5000;
                 continue;
             }
-            if (Date.now() - startedAt > 10 * 60 * 1000) backoff = 5000; // 稳定跑过一段时间就重置退避
+            if (reason === "cookies-invalid") {
+                await waitForCookieChange(cfg, selected, isStopping);
+                backoff = 5000;
+                continue;
+            }
+            // 只有真正注册成功过才重置退避；一直注册不上则持续加大间隔
+            if (session.everRegistered) backoff = 5000;
             log(`${Math.round(backoff / 1000)}s 后重启浏览器`);
             await sleepUntil(backoff, isStopping);
             backoff = Math.min(backoff * 2, 5 * 60 * 1000);
         }
     } finally {
         await fwd.close();
+    }
+}
+
+// Cookie 失效后阻塞，直到推送文件变化（重新推送）。期间不启动浏览器、不访问 Google。
+async function waitForCookieChange(cfg, selected, isStopping) {
+    log("等待重新推送 Cookie…");
+    while (!isStopping()) {
+        await sleepUntil(cfg.cookiePollMs, isStopping);
+        const cur = lib.selectCookieFile({ dir: cfg.cookieDir, file: cfg.cookieFile, label: cfg.cookieLabel });
+        if (cur && (cur.file !== selected.file || cur.mtimeMs !== selected.mtimeMs)) {
+            log(`检测到新的 Cookie 推送（${path.basename(cur.file)}），重新启动`);
+            return;
+        }
     }
 }
 
