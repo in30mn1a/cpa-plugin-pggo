@@ -56,8 +56,11 @@ func textOf(raw json.RawMessage) string {
 // routeModel 按最长匹配前缀决定执行通道并剥掉该前缀：
 // <model_prefix> → page，<headless_model_prefix> → headless；
 // 都不匹配时走 page（兼容 model_map 里的裸名）。model_map 按完整请求名查。
+// 前缀为空表示该通道停用：不参与匹配；page 停用时不匹配的请求返回空通道（不可路由）。
 func routeModel(c pluginConfig, requested string) (channel, upstream string) {
-	channel = channelPage
+	if c.ModelPrefix != "" {
+		channel = channelPage
+	}
 	name := requested
 	matched := -1
 	for _, cand := range []struct{ prefix, channel string }{

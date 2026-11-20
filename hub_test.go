@@ -516,7 +516,7 @@ func TestEnsureHubRebindsOnListenChange(t *testing.T) {
 // 页面重复发送 stream-end 不得触发重复 close panic。
 func TestFinishTwiceIsNoop(t *testing.T) {
 	h := &hub{pending: map[string]*waiter{"r1": {done: make(chan struct{})}}}
-	h.finish("r1", nil)
-	h.finish("r1", nil)
-	h.appendChunk("r1", "late")
+	h.finish(nil, "r1", nil)
+	h.finish(nil, "r1", nil)
+	h.appendChunk(nil, "r1", "late")
 }

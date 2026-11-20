@@ -4,6 +4,9 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -359,5 +362,167 @@ func TestExecEndpointRoutesHeadless(t *testing.T) {
 	}
 	if got := call("pggo/gemini-x"); got != "headless:models/gemini-x" {
 		t.Fatalf("pggo/ 应路由到 headless: %q", got)
+	}
+}
+
+// 执行器断开时，它名下的未完成请求应立即以 502 executor_disconnected 结束，而不是等超时。
+func TestDisconnectFailsOwnedRequests(t *testing.T) {
+	h := startTestHub(t)
+	h.mu.Lock()
+	h.cfg.RequestTimeoutSec = 60
+	h.mu.Unlock()
+	addr := h.ln.Addr().String()
+	headless := registerTestWS(t, addr, "/api/pg/ws?channel=headless")
+	done := make(chan error, 1)
+	go func() {
+		_, err := h.dispatch(channelHeadless, "m", []any{"x"}, "hi")
+		done <- err
+	}()
+	if msg := headless.readText(t); !strings.Contains(msg, `"request"`) {
+		t.Fatalf("应收到 request: %s", msg)
+	}
+	started := time.Now()
+	_ = headless.c.Close()
+	select {
+	case err := <-done:
+		re, ok := err.(*rpcError)
+		if !ok || re.code != "executor_disconnected" || re.status != http.StatusBadGateway {
+			t.Fatalf("应返回 502 executor_disconnected，得到 %#v", err)
+		}
+		if time.Since(started) > 3*time.Second {
+			t.Fatalf("断线后结束过慢: %s", time.Since(started))
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("断线后请求没有及时结束")
+	}
+}
+
+// 其它连接（另一通道）不能按 rid 续写或结束不属于自己的请求。
+func TestForeignConnCannotFinishRequest(t *testing.T) {
+	h := startTestHub(t)
+	addr := h.ln.Addr().String()
+	page := registerTestWS(t, addr, "/api/pg/ws")
+	headless := registerTestWS(t, addr, "/api/pg/ws?channel=headless")
+	type res struct {
+		raw string
+		err error
+	}
+	done := make(chan res, 1)
+	go func() {
+		raw, err := h.dispatch(channelHeadless, "m", []any{"x"}, "hi")
+		done <- res{raw, err}
+	}()
+	var req struct {
+		RequestID string `json:"requestId"`
+	}
+	_ = json.Unmarshal([]byte(headless.readText(t)), &req)
+
+	// page 冒充：发分块与 stream-end，应被忽略
+	fake, _ := json.Marshal(map[string]any{"type": "stream-chunk", "requestId": req.RequestID, "chunkBody": "EVIL"})
+	fakeEnd, _ := json.Marshal(map[string]any{"type": "stream-end", "requestId": req.RequestID})
+	_ = page.sendText(string(fake))
+	_ = page.sendText(string(fakeEnd))
+	select {
+	case r := <-done:
+		t.Fatalf("非所属连接不应能结束请求: %+v", r)
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	real, _ := json.Marshal(map[string]any{"type": "stream-chunk", "requestId": req.RequestID, "chunkBody": "ok"})
+	end, _ := json.Marshal(map[string]any{"type": "stream-end", "requestId": req.RequestID})
+	_ = headless.sendText(string(real))
+	_ = headless.sendText(string(end))
+	select {
+	case r := <-done:
+		if r.err != nil || r.raw != "ok" {
+			t.Fatalf("所属连接结果错误: %+v", r)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("所属连接结束请求超时")
+	}
+}
+
+// 前缀为空 = 停用该通道：不注册模型、不路由。
+func TestEmptyPrefixDisablesChannel(t *testing.T) {
+	section := "enabled: true\nlisten: 127.0.0.1:0\nmodel_prefix: \"\"\nheadless_model_prefix: pggo/\nmodels:\n  - gemini-x\n"
+	req, _ := json.Marshal(map[string]any{"config_yaml": []byte(section)})
+	t.Cleanup(shutdownHub)
+	applyConfig(req)
+	c := currentConfig()
+	if c.ModelPrefix != "" || c.HeadlessModelPrefix != "pggo/" {
+		t.Fatalf("显式空前缀解析错误: %q %q", c.ModelPrefix, c.HeadlessModelPrefix)
+	}
+	models := modelRegistrationPayload().Models
+	if len(models) != 1 || models[0].ID != "pggo/gemini-x" {
+		t.Fatalf("page 停用后只应注册 headless 一套: %+v", models)
+	}
+	if ch, _ := routeModel(c, "gemini-x"); ch != "" {
+		t.Fatalf("page 停用时裸名不应路由，得到 %q", ch)
+	}
+	if ch, up := routeModel(c, "pggo/gemini-x"); ch != channelHeadless || up != "gemini-x" {
+		t.Fatalf("headless 路由错误: %s %s", ch, up)
+	}
+	h := activeHub()
+	if _, err := h.dispatch("", "gemini-x", []any{"x"}, "hi"); err == nil {
+		t.Fatal("不可路由的模型应报错")
+	} else if re, ok := err.(*rpcError); !ok || re.code != "model_not_routable" {
+		t.Fatalf("应返回 model_not_routable，得到 %#v", err)
+	}
+
+	// headless 停用
+	c2 := defaultConfig()
+	c2.HeadlessModelPrefix = ""
+	cfgMu.Lock()
+	cfg = c2
+	cfgMu.Unlock()
+	for _, m := range modelRegistrationPayload().Models {
+		if !strings.HasPrefix(m.ID, "pg-") {
+			t.Fatalf("headless 停用后不应注册 %s", m.ID)
+		}
+	}
+	if ch, _ := routeModel(c2, "pggo-gemini-x"); ch != channelPage {
+		t.Fatalf("headless 停用时 pggo- 只能落到 page（pg 前缀不匹配则是裸名回落），得到 %q", ch)
+	}
+}
+
+// Cookie 推送原子落盘；Unix 上目录 0750、文件 0640。
+func TestPushWritesCookieFileAtomically(t *testing.T) {
+	h := startTestHub(t)
+	addr := h.ln.Addr().String()
+	dir := filepath.Join(h.cfg.DataDir, "cookies")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	old := filepath.Join(dir, "a@b.c.json")
+	if err := os.WriteFile(old, []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		req, _ := http.NewRequest(http.MethodPost, "http://"+addr+"/api/pggo/push", strings.NewReader(`{"email":"a@b.c","cookies":[{"name":"SID"}]}`))
+		req.Header.Set("X-API-Key", "cat-test")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != 200 {
+			t.Fatalf("推送失败 %d", resp.StatusCode)
+		}
+	}
+	raw, _ := os.ReadFile(old)
+	if !strings.Contains(string(raw), `"SID"`) {
+		t.Fatalf("文件未被覆盖: %s", raw)
+	}
+	entries, _ := os.ReadDir(dir)
+	if len(entries) != 1 {
+		t.Fatalf("不应残留临时文件: %v", entries)
+	}
+	if runtime.GOOS != "windows" {
+		if st, _ := os.Stat(old); st.Mode().Perm() != 0o640 {
+			t.Fatalf("文件权限应为 0640，得到 %v", st.Mode().Perm())
+		}
+		if st, _ := os.Stat(dir); st.Mode().Perm() != 0o750 {
+			t.Fatalf("目录权限应为 0750，得到 %v", st.Mode().Perm())
+		}
 	}
 }

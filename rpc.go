@@ -121,11 +121,27 @@ func applyConfig(request []byte) {
 				*dst = v
 			}
 		}
+		// 前缀写成显式空串（`model_prefix: ""`）= 停用该通道；不写或留空则保持默认
+		for key, dst := range map[string]*string{
+			"model_prefix":          &next.ModelPrefix,
+			"headless_model_prefix": &next.HeadlessModelPrefix,
+		} {
+			if yamlExplicitEmpty(yamlText, key) {
+				*dst = ""
+			}
+		}
 		if models := yamlListBlock(yamlText, "models"); len(models) > 0 {
 			next.Models = models
 		}
 	}
-	if next.HeadlessModelPrefix == next.ModelPrefix {
+	switch {
+	case next.ModelPrefix == "" && next.HeadlessModelPrefix == "":
+		logf("model_prefix 与 headless_model_prefix 均为空：两个通道都已停用，不注册任何模型")
+	case next.ModelPrefix == "":
+		logf("model_prefix 为空：page 通道已停用")
+	case next.HeadlessModelPrefix == "":
+		logf("headless_model_prefix 为空：headless 通道已停用")
+	case next.HeadlessModelPrefix == next.ModelPrefix:
 		logf("headless_model_prefix 与 model_prefix 相同（%q）：无头通道模型不注册，请改成不同前缀", next.ModelPrefix)
 	}
 	if len(next.APIKeys) == 0 {
@@ -166,6 +182,12 @@ func yamlScalar(yamlText, key string) string {
 	default:
 		return m[4]
 	}
+}
+
+// yamlExplicitEmpty 判断某键是否被显式写成空串（双引号或单引号的空值）。
+func yamlExplicitEmpty(yamlText, key string) bool {
+	re := regexp.MustCompile(`(?m)^[ \t]*` + regexp.QuoteMeta(key) + `[ \t]*:[ \t]*(""|'')[ \t]*(#.*)?\r?$`)
+	return re.MatchString(yamlText)
 }
 
 // yamlListBlock 解析 `api-keys:` 下的块列表或行内列表。
@@ -310,8 +332,12 @@ type modelRegistration struct {
 func modelRegistrationPayload() modelRegistration {
 	c := currentConfig()
 	out := modelRegistration{Provider: "pggo"}
-	prefixes := []string{c.ModelPrefix}
-	if c.HeadlessModelPrefix != c.ModelPrefix {
+	// 前缀为空 = 该通道停用，不注册（否则会把裸模型名注册进 CPA，与其它 provider 撞名）
+	var prefixes []string
+	if c.ModelPrefix != "" {
+		prefixes = append(prefixes, c.ModelPrefix)
+	}
+	if c.HeadlessModelPrefix != "" && c.HeadlessModelPrefix != c.ModelPrefix {
 		prefixes = append(prefixes, c.HeadlessModelPrefix)
 	}
 	for _, prefix := range prefixes {

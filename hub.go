@@ -25,6 +25,7 @@ const maxFrameBytes = 32 << 20 // 单帧上限：历史很长时请求体会很�
 // ---------------------------------------------------------------- 中枢 ----
 
 type waiter struct {
+	conn   *wsConn // 请求投递到的执行器连接；只有它能续写/结束这个请求
 	chunks []string
 	done   chan struct{}
 	err    error
@@ -180,7 +181,7 @@ func (h *hub) close() {
 		conn.shutdown()
 	}
 	for _, rid := range rids {
-		h.finish(rid, rpcErrf(http.StatusServiceUnavailable, "hub_restarting", "执行器中枢重启，请重试"))
+		h.finish(nil, rid, rpcErrf(http.StatusServiceUnavailable, "hub_restarting", "执行器中枢重启，请重试"))
 	}
 }
 
@@ -200,6 +201,10 @@ func (h *hub) keyValid(key string) bool {
 // dispatch 把一次上游请求投给指定通道的在线执行器，等它把上游原文拼完。
 // 目标通道离线时直接 503，不静默回落到其它通道。
 func (h *hub) dispatch(channel, model string, wire []any, binding string) (string, error) {
+	if channel == "" {
+		return "", rpcErrf(http.StatusNotFound, "model_not_routable",
+			"模型 %s 不属于任何已启用的执行器通道（对应前缀为空即停用）", model)
+	}
 	h.mu.Lock()
 	conn := h.conns[channel]
 	if conn == nil || conn.isClosed() {
@@ -212,7 +217,7 @@ func (h *hub) dispatch(channel, model string, wire []any, binding string) (strin
 			"通道 page 没有在线页面执行器：请用浏览器打开 AI Studio 页面并让脚本连上 WS")
 	}
 	rid := newID()
-	w := &waiter{done: make(chan struct{})}
+	w := &waiter{conn: conn, done: make(chan struct{})}
 	h.pending[rid] = w
 	timeout := time.Duration(h.cfg.RequestTimeoutSec) * time.Second
 	h.mu.Unlock()
@@ -252,24 +257,44 @@ func (h *hub) dispatch(channel, model string, wire []any, binding string) (strin
 
 // finish 结束一个请求。先从 pending 摘除再关 done：页面重复发送 stream-end/error
 // 或结束后迟到的分块都会变成空操作，避免重复 close 触发 panic 拖垮宿主进程。
-func (h *hub) finish(rid string, err error) {
+// from 非 nil 时只允许请求的所属连接结束它（防止别的通道/连接按 rid 抢结束）；
+// nil 表示中枢自身（关闭/断线清理）。
+func (h *hub) finish(from *wsConn, rid string, err error) {
 	h.mu.Lock()
 	w := h.pending[rid]
-	delete(h.pending, rid)
-	h.mu.Unlock()
-	if w == nil {
+	if w == nil || (from != nil && w.conn != from) {
+		h.mu.Unlock()
 		return
 	}
+	delete(h.pending, rid)
+	h.mu.Unlock()
 	w.err = err
 	close(w.done)
 }
 
-func (h *hub) appendChunk(rid, chunk string) {
+// appendChunk 只接受所属连接的分块。分块在持锁时追加：同一 rid 只有所属连接的
+// 读循环会写，持锁也让与 finish 的先后关系明确。
+func (h *hub) appendChunk(from *wsConn, rid, chunk string) {
 	h.mu.Lock()
-	w := h.pending[rid]
-	h.mu.Unlock()
-	if w != nil {
+	defer h.mu.Unlock()
+	if w := h.pending[rid]; w != nil && w.conn == from {
 		w.chunks = append(w.chunks, chunk)
+	}
+}
+
+// failConn 在执行器连接断开时立即结束它名下所有未完成请求（不再干等 request_timeout_sec）。
+func (h *hub) failConn(conn *wsConn, channel string) {
+	h.mu.Lock()
+	var rids []string
+	for rid, w := range h.pending {
+		if w.conn == conn {
+			rids = append(rids, rid)
+		}
+	}
+	h.mu.Unlock()
+	for _, rid := range rids {
+		h.finish(nil, rid, rpcErrf(http.StatusBadGateway, "executor_disconnected",
+			"%s（通道 %s）在请求完成前断开", channelLabel(channel), channel))
 	}
 }
 
@@ -397,15 +422,45 @@ func (h *hub) servePush(w http.ResponseWriter, r *http.Request) {
 		label = "unknown"
 	}
 	dir := filepath.Join(h.config().DataDir, "cookies")
-	_ = os.MkdirAll(dir, 0o700)
 	name := sanitize(label) + ".json"
-	_ = os.WriteFile(filepath.Join(dir, name), raw, 0o600)
+	if err := writeCookieFile(dir, name, raw); err != nil {
+		logf("Cookie 推送落盘失败: %s: %v", name, err)
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"detail": "落盘失败"})
+		return
+	}
 	logf("Cookie 推送已存档: %s（%d 条）", name, len(body.Cookies))
 	writeJSON(w, http.StatusOK, map[string]any{
 		"label":      label,
 		"created_at": time.Now().Unix(),
 		"cookies":    len(body.Cookies),
 	})
+}
+
+// writeCookieFile 原子写入 Cookie 推送文件：目录 0750、文件 0640（同组可读，
+// 供以 gid 0 运行的无头 worker 只读挂载读取），先写临时文件再 rename，
+// worker 不会读到写了一半的文件。已存在的目录/文件也收紧到同样权限。
+func writeCookieFile(dir, name string, raw []byte) error {
+	if err := os.MkdirAll(dir, 0o750); err != nil {
+		return err
+	}
+	_ = os.Chmod(dir, 0o750)
+	tmp, err := os.CreateTemp(dir, "."+name+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName) // rename 成功后是空操作
+	if _, err := tmp.Write(raw); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Chmod(tmpName, 0o640); err != nil {
+		return err
+	}
+	return os.Rename(tmpName, filepath.Join(dir, name))
 }
 
 func (h *hub) serveRobin(w http.ResponseWriter, r *http.Request) {
@@ -541,16 +596,16 @@ func (h *hub) serveWS(w http.ResponseWriter, r *http.Request) {
 			_ = conn.writeText(mustJSON(map[string]any{"type": "pong"}))
 		case "stream-chunk":
 			if authed {
-				h.appendChunk(msg.RequestID, msg.ChunkBody)
+				h.appendChunk(conn, msg.RequestID, msg.ChunkBody)
 			}
 		case "stream-end":
 			if authed {
-				h.finish(msg.RequestID, nil)
+				h.finish(conn, msg.RequestID, nil)
 			}
 		case "response":
 			if authed {
-				h.appendChunk(msg.RequestID, msg.RawResponse)
-				h.finish(msg.RequestID, nil)
+				h.appendChunk(conn, msg.RequestID, msg.RawResponse)
+				h.finish(conn, msg.RequestID, nil)
 			}
 		case "error":
 			if authed {
@@ -568,7 +623,7 @@ func (h *hub) serveWS(w http.ResponseWriter, r *http.Request) {
 						text = msg.Error.Message
 					}
 				}
-				h.finish(msg.RequestID, rpcErrf(status, code, "%s", text))
+				h.finish(conn, msg.RequestID, rpcErrf(status, code, "%s", text))
 			}
 		}
 	}
@@ -578,6 +633,7 @@ func (h *hub) serveWS(w http.ResponseWriter, r *http.Request) {
 		delete(h.conns, channel)
 	}
 	h.mu.Unlock()
+	h.failConn(conn, channel)
 	if authed {
 		logf("%s下线（通道 %s）", channelLabel(channel), channel)
 	}
