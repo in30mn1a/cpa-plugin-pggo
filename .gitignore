@@ -4,3 +4,4 @@ data/
 pggo-data/
 release/
 _loader_tmp.c
+node_modules/

@@ -1,0 +1,23 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>AI Studio stub</title>
+<script>
+  // 让用户脚本认为页面 bundle 已就绪（真实页面由 AI Studio 的 JS 定义）
+  window.default_MakerSuite = {};
+  window.__stubProbe = {
+    hc: navigator.hardwareConcurrency,
+    screen: [screen.width, screen.height],
+    inner: [innerWidth, innerHeight],
+    gmLeak: typeof window.GM_getValue,
+    webdriver: navigator.webdriver,
+    ua: navigator.userAgent,
+    platform: navigator.platform,
+    uaData: navigator.userAgentData ? { platform: navigator.userAgentData.platform, brands: navigator.userAgentData.brands.map(b => b.brand) } : null,
+    tz: Intl.DateTimeFormat().resolvedOptions().timeZone,
+    lang: navigator.language,
+  };
+  console.log("[PG-EXEC] stub-probe " + JSON.stringify(window.__stubProbe));
+</script>
+</head>
+<body><p>stub</p></body>
+</html>
