@@ -108,8 +108,8 @@ cp bin/linux-amd64/pggo.so plugins/linux/amd64/pggo-v1.1.0.so
 | `script_path` | 用户脚本文件路径（容器内路径，需挂载），供 `/api/pg/script.user.js` 分发；不填就不提供分发 |
 | `data_dir` | Cookie 推送 / Robin 绑定落盘目录，默认 `pggo-data` |
 | `models` | 上游模型 ID 列表，每个注册两遍（见下两行）；不填用内置默认列表。**上游 ID 必须真实存在**（插件不做 ListModels 探测） |
-| `model_prefix` | page 通道（真实浏览器）模型前缀，默认 `pg-`，可改成 `pg/` |
-| `headless_model_prefix` | headless 通道（云端无头 worker）模型前缀，默认 `pggo-`，可改成 `pggo/`；**必须与 `model_prefix` 不同**（相同时只注册 page 一套并在日志告警） |
+| `model_prefix` | page 通道（真实浏览器）模型前缀，默认 `pg-`，可改成 `pg/`；写成显式空串 `""` 即停用 page 通道（不注册、不路由） |
+| `headless_model_prefix` | headless 通道（云端无头 worker）模型前缀，默认 `pggo-`，可改成 `pggo/`；**必须与 `model_prefix` 不同**（相同时只注册 page 一套并在日志告警）；显式空串 `""` 即停用 headless 通道 |
 | `config_file` | 可选。JSON 配置文件（模板 `config.example.json`），用于 `model_map` / `timezone` / `max_output_tokens` / `request_timeout_sec` 等高级项；面板字段非空时优先 |
 
 等价的 `config.yaml` 写法：
@@ -172,7 +172,7 @@ location /api/robin/ { proxy_pass http://127.0.0.1:8788; proxy_read_timeout 1800
 `headless/` 是一个独立的小服务（Node.js + Playwright + Chromium，自带 Dockerfile），跑在 CPA 旁边，让 `pggo-*` 模型**不依赖你的浏览器挂机**：
 
 1. 读取中枢落盘的 Cookie 推送文件（浏览器脚本面板里点「推送 Cookie」→ `POST /api/pggo/push` → `data_dir/cookies/<邮箱>.json`）；
-2. 按推送里的浏览器现场建 Chromium 上下文：UA（去掉 `HeadlessChrome`，并同步 `navigator.userAgentData` / `navigator.platform`）、语言、时区、视口/屏幕、DPR、CPU 核数；注入 Cookie（含 HttpOnly 的 `SAPISID` / `__Secure-*`，按 host-only / 域 Cookie、`__Host-`、`sameSite`、过期时间正确换算；**日志只打 Cookie 名，从不打值**）；
+2. 按推送里的浏览器现场建 Chromium 上下文：UA（保留推送的平台/OS，Chrome 版本号对齐镜像里实际的 Chromium 大版本，去掉 `HeadlessChrome`，并同步 `navigator.userAgentData` / `navigator.platform`）、语言、时区、视口/屏幕、DPR、CPU 核数；注入 Cookie（含 HttpOnly 的 `SAPISID` / `__Secure-*`，按 host-only / 域 Cookie、`__Host-`、`sameSite`、过期时间正确换算；**日志只打 Cookie 名，从不打值**）；
 3. 打开 `https://aistudio.google.com[/u/N]/prompts/new_chat?temporary=true`（`N` = 推送里的 `authuser`，与脚本换号逻辑一致）；
 4. 在 `document-start` 用 `addInitScript` 注入同一份用户脚本（脚本是 `@run-at document-start`，必须早于页面 bundle 拿走 `fetch` 引用，fetch/XHR 捕获才有效），并提供脚本用到的 GM 环境：
    - `unsafeWindow` = `window`；`@noframes` / `@match` 守卫（子帧、非 `aistudio.google.com/*prompts*` 页面不执行）；
@@ -183,7 +183,11 @@ location /api/robin/ { proxy_pass http://127.0.0.1:8788; proxy_read_timeout 1800
 5. 把脚本里的 `WS_URL` 改写成内部地址（默认 `ws://cliproxy:8788/api/pg/ws?channel=headless`）。https 页面连明文 `ws://cliproxy` 会被当混合内容拦截，所以 worker 在进程内开一个 `127.0.0.1` 随机端口做 TCP 透传，页面实际连的是环回地址，并为 AI Studio 源预授 `local-network-access`；
 6. 脚本随后像真实浏览器一样 `register`，中枢把它放进 `headless` 通道。
 
-**看门狗**：监听页面 WS 帧判断是否已注册；超过 `PGGO_REGISTER_TIMEOUT_SEC` 未注册就重载页面，连续 `PGGO_MAX_RELOADS` 次仍不行则重启浏览器（指数退避 5s → 5min）；页面崩溃自动重建；被另一个 headless worker 顶替（4001）或 Key 被拒（4008）时放慢到 10 分钟一次，避免两个 worker 互顶；Cookie 文件变化（重新推送）时自动重启会话；页面空闲且运行超过 `PGGO_RECYCLE_HOURS` 时定期重载回收内存；`SIGTERM` 优雅退出。
+**轮换 Cookie 持久化**：Google 会在运行中轮换 Cookie（`__Secure-*PSIDTS` 等），新值只在浏览器内存里。worker 注册成功后每 `PGGO_STATE_SAVE_MIN` 分钟、以及优雅退出时，把 Cookie 罐写到 `PGGO_STATE_DIR/<邮箱>.state.json`（0600）；重启时若该状态文件**属于同一账号且派生自当前这份推送**就优先使用。浏览器重新推送后（推送文件变了）旧状态自动作废。Cookie 失效时不保存。
+
+**Cookie 失效**：页面被重定向到 Google 登录/验证页（任何非 `aistudio.google.com` 的 `*.google.com`）时，worker 不再重载，日志明确提示「重新推送 Cookie」，关闭浏览器并**一直等到推送文件变化**才重新启动，避免反复访问登录页。
+
+**看门狗**：监听页面 WS 帧判断是否已注册；超过 `PGGO_REGISTER_TIMEOUT_SEC` 未注册就重载页面，连续 `PGGO_MAX_RELOADS` 次仍不行则重启浏览器（指数退避 5s → 5min）；页面崩溃自动重建；被另一个 headless worker 顶替（4001）或 Key 被拒（4008）时放慢到 10 分钟一次，避免两个 worker 互顶；Cookie 文件变化（重新推送）时先等进行中的请求结束（最多 `PGGO_DRAIN_SEC` 秒）再重启会话；浏览器重启的退避只在成功注册过之后才重置；页面空闲且运行超过 `PGGO_RECYCLE_HOURS` 时定期重载回收内存；`SIGTERM` 优雅退出。
 
 ### 环境变量
 
@@ -193,7 +197,7 @@ location /api/robin/ { proxy_pass http://127.0.0.1:8788; proxy_read_timeout 1800
 | `PGGO_WS_URL` | `ws://cliproxy:8788/api/pg/ws?channel=headless` | 中枢 WS 地址；缺 `channel` 参数会自动补 `channel=headless`；非环回的 `ws://` 自动走本机透传，`wss://` 直连 |
 | `PGGO_COOKIE_DIR` | `/data/cookies` | Cookie 推送目录（挂载 `data_dir/cookies`，只读即可） |
 | `PGGO_COOKIE_FILE` | 空 | 指定文件名（相对 `PGGO_COOKIE_DIR`）或绝对路径 |
-| `PGGO_COOKIE_LABEL` | 空 | 按邮箱选文件（匹配文件名或文件内 `email`）；`FILE` 与 `LABEL` 都不填时用目录里**最新**的 `*.json` |
+| `PGGO_COOKIE_LABEL` | 空（**强烈建议设置**） | 按邮箱选文件（匹配文件名或文件内 `email`）；`FILE` 与 `LABEL` 都不填时用目录里**最新**的 `*.json`，目录里有多个账号时日志会告警并写明选中的账号（只写邮箱/文件名） |
 | `PGGO_SCRIPT_PATH` | `/app/userscript.user.js` | 换过域名的用户脚本（与 `script_path` 同一份即可） |
 | `PGGO_HEADLESS_MODE` | `xvfb` | `xvfb` = 有头 Chromium 跑在 Xvfb 虚拟屏上；`new` = Chromium 新 headless |
 | `PGGO_START_URL` | 按 `authuser` 推导 | 覆盖起始页 |
@@ -203,6 +207,11 @@ location /api/robin/ { proxy_pass http://127.0.0.1:8788; proxy_read_timeout 1800
 | `PGGO_RECYCLE_HOURS` | `6` | 空闲时定期重载页面；`0` 关闭 |
 | `PGGO_COOKIE_POLL_SEC` | `10` | 检查 Cookie 文件变化的间隔 |
 | `PGGO_PAGE_LOG` | `1` | 转发脚本 `[PG-EXEC]` 日志；`0` 关闭 |
+| `PGGO_STATE_DIR` | `/state` | 轮换 Cookie 的保存目录（需可写，挂命名卷）；设为空串关闭持久化 |
+| `PGGO_STATE_SAVE_MIN` | `10` | 注册后保存 Cookie 状态的间隔（分钟） |
+| `PGGO_DRAIN_SEC` | `60` | Cookie 更新重启前等待进行中请求的上限 |
+
+`PGGO_WS_URL` 里的 `channel` 参数总是被强制改成 `headless`，worker 不可能注册到 page 通道去顶掉你的真实浏览器。
 
 **`xvfb` 还是 `new`？** 默认 `xvfb`。这条链路成败取决于页面里的 BotGuard/WAA proof，有头浏览器是与真实用户差异最小的形态；
 Chromium「新 headless」已与有头共用同一内核，差异很小，但仍有少量 headless 特有信号。代价是镜像多一个 `xvfb` 包（约 +10–20MB）、运行时多一个 Xvfb 进程（约 +20–50MB 内存）。
@@ -217,26 +226,34 @@ services:
     restart: unless-stopped
     mem_limit: 1g                          # 目标常驻 < ~600MB，留余量给 AI Studio 页面
     shm_size: 256m
-    # CPA 以 root 写 Cookie 文件（0600），worker 默认以 uid 10001 运行读不到；
-    # 两边 uid 不一致时用 root 运行（Chromium 已带 --no-sandbox）
-    user: "0:0"
+    # 非 root 运行：Playwright 下 Chromium 带 --no-sandbox，不能用 root。
+    # 中枢把 Cookie 写成 root:root 0640（目录 0750），gid 0 即可只读访问。
+    user: "10001:0"
     environment:
       PGGO_API_KEY: "<与插件 api-keys 相同>"
       PGGO_WS_URL: "ws://cliproxy:8788/api/pg/ws?channel=headless"
       PGGO_COOKIE_DIR: /data/cookies
       PGGO_SCRIPT_PATH: /app/userscript.user.js
       PGGO_HEADLESS_MODE: xvfb
-      # PGGO_COOKIE_LABEL: "you@gmail.com"
+      PGGO_COOKIE_LABEL: "you@gmail.com"   # 强烈建议：明确用哪个账号的推送
     volumes:
       - ./pggo/data/cookies:/data/cookies:ro                                   # = 插件 data_dir/cookies
+      - pggo-headless-state:/state                                             # 轮换后的 Cookie（worker 可写）
       - "./pggo/Catiecli Playground Executor.user.js:/app/userscript.user.js:ro"
     networks: [default]                     # 与 cliproxy 同一网络；不对外发布端口
     depends_on: [cliproxy]
+
+volumes:
+  pggo-headless-state:
 ```
+
+> v1.1.0 之前推送的旧文件是 0600，需要重新推送一次（或手动 `chmod 640`、目录 `chmod 750`）worker 才读得到。
 
 插件侧 `listen` 要能被同网络容器访问（`0.0.0.0:8788`）。worker 不需要经过 Caddy，也不需要公网域名。
 
 ### ⚠ 风险说明
+
+- **已知限制**：UA / UA-CH / `navigator.platform` 的覆盖作用于页面主线程；脚本或页面创建的**专用 Worker**（Dedicated Worker）里 `navigator.platform` / `userAgentData` 仍可能暴露真实平台（Linux）。没有找到低成本的可靠修复，若 Google 在 Worker 里采集这些字段，平台不一致可被识别。
 
 - **数据中心 IP + 自动化浏览器可能触发 Google 风控**（要求重新登录、`CookieMismatch`、账号受限等）。worker 尽量复刻推送时的浏览器现场，但出口 IP、TLS/网络特征、GPU（软件渲染）与真实设备不同，**无法保证不被识别**，也无法保证 Cookie 长期有效。建议用非主力账号，出问题时在真实浏览器里重新登录并重新推送 Cookie（worker 会自动加载新文件）。
 - 推送文件就是账号凭据：目录只读挂载给 worker，不要放进镜像或版本库。
@@ -292,7 +309,8 @@ curl -X POST https://your.domain.example/api/pg/exec \
 - **每通道单执行器**：同一通道内新连接顶替旧连接（关闭码 `4001`），被顶的页面不自动重连；page 与 headless 两个通道互不顶替。
 - **只有文本**：图片/音频/函数调用/grounding 没有编码，请求里出现图片会丢。
 - **思考摘要不进正文**：`part[12]=1` 的帧归到 `thoughts` 字段，不下发到 `choices`。
-- `/api/pggo/push` 收到的 Cookie 落 `data_dir/cookies/<邮箱>.json`（0600），由云端无头 worker 读取（见下节）。
+- `/api/pggo/push` 收到的 Cookie 原子写入 `data_dir/cookies/<邮箱>.json`（文件 0640、目录 0750），由云端无头 worker 读取（见下节）。
+- 执行器在请求完成前断开时，它名下的请求立即以 `502 executor_disconnected` 结束；只有接收请求的那条连接能续写/结束该请求。
 - Robin 凭证绑定落 `data/robin.jsonl`，消费方自理。
 
 ## 排错
