@@ -9,7 +9,7 @@
  Gemini 协议) ──────┼─▶ model=pg-gemini-3.8-flash                              │
                     │        │                                                 │
                     │        ▼   pggo 插件（C ABI 原生插件）                    │
-                    │   executor.execute  →  OpenAI chat  →  MakerSuite wire    │
+                    │   model.route=self → executor.execute → MakerSuite wire   │
                     │        │                                                 │
                     │        ▼   插件内嵌中枢 127.0.0.1:8788                     │
                     │   WS /api/pg/ws  ◀──────┐                                │
@@ -33,10 +33,29 @@ v1.1.0 起中枢有两个**执行器通道**，同一个 Key 可以同时在线�
 
 | 能力 | 说明 |
 |---|---|
-| `executor` | CPA 里 `pg-*` / `pggo-*` 模型的请求，编码成 MakerSuite `GenerateContent` wire，按前缀投给对应通道的在线执行器，响应解码回 OpenAI 格式 |
-| `model_registrar` | 把 `models` 配置里的模型注册两遍：`<model_prefix><name>`（page）与 `<headless_model_prefix><name>`（headless） |
+| `model_router` | 对命中 `model_prefix` / `headless_model_prefix` 的模型回 `self`，让 CPA 跳过「凭证选择」直接调本插件执行器（v1.1.1，见下文「为什么需要 model_router」）；其它模型一律不处理 |
+| `executor` | 作用域 `static`（无凭证）。CPA 里 `pg-*` / `pggo-*` 模型的请求，编码成 MakerSuite `GenerateContent` wire，按前缀投给对应通道的在线执行器，响应解码回 OpenAI 格式 |
+| `model_registrar` | 把 `models` 配置里的模型注册两遍：`<model_prefix><name>`（page）与 `<headless_model_prefix><name>`（headless），供 `/v1/models` 列出 |
 | 内嵌中枢 | `WS /api/pg/ws`、`GET /api/pg/script.user.js`、`POST /api/pggo/push`、`POST /api/robin/bind-by-key`、`GET /api/pg/status`、`POST /api/pg/exec` |
 | 执行器 Key | 写在 `plugins.configs.pggo.api-keys`（或 JSON 的 `api_keys`），两处合并。建议填与 CPA 顶层 `api-keys` 相同的值，脚本面板与客户端就用同一个 Key |
+
+### 为什么需要 model_router（v1.1.1 修复 `auth_not_found`）
+
+v1.1.0 只声明了 `model_registrar` + `executor`：`/v1/models` 能列出 `pg/…`、`pggo/…`，但请求在 ~20ms 内返回
+`503 auth_not_found: no auth available (providers=pggo, …)`，执行器从未被调用。按 CPA 源码（`router-for-me/CLIProxyAPI` main @ `6faa8d2`）：
+
+- 静态执行器模型只是以 `plugin:pggo:pggo:executor` 注册进模型表（`internal/pluginhost/adapters_executors.go` 141–147、276 `RegisterClient`），用于列表；
+- 常规执行路径 `AuthManager.Execute` → `pickNextMixed` 只在 `m.auths` 里找 provider 匹配的**凭证记录**（`sdk/cliproxy/auth/conductor_selection.go` 2988 起），
+  `pggo` 没有任何凭证，于是 `auth_not_found`（`conductor_execution.go` 414）；
+- 无凭证插件执行器的入口是 **ModelRouter**：handler 在解析 provider 之前先问路由器（`sdk/api/handlers/handlers_execution.go` 57–63、`handlers_routing.go` 362–392），
+  路由器回 `Handled + TargetKind=self` 后走 `executeWithPluginExecutor` → `Host.ExecutePluginExecutor`，以 `nil` 凭证直接调执行器
+  （`internal/pluginhost/executor_route.go` 86–113；就绪检查 `executorPluginReady` 要求执行器允许静态模型且格式兼容）。官方示例
+  `examples/plugin/claude-web-search-router` 也是 `model_router` + `executor`（`executor_model_scope: static`）。
+
+所以 v1.1.1 增加 `model_router`、执行器作用域改为 `static`。**CPA 侧不需要任何额外配置**（不需要凭证条目）。
+限制：CPA 开启 Home（集群）模式时插件执行器路由不可用（`executeWithPluginExecutor` 直接 503）；Claude 原生入口（`/v1/messages`）因执行器只接受
+chat-completions，路由就绪检查不通过，会回落到常规路径并报 `auth_not_found`——请用 OpenAI 兼容入口。以上为源码核对 + 单元测试（注册载荷形态、`model.route` 编解码），
+尚未在运行中的 CPA 上实测。
 
 wire 编解码按 [AI Studio 私有协议](https://github.com/Mag1cFall/AIStudio2API/blob/main/docs/protocol.md) 的字段表实现：
 根数组 `[0]=models/<id>`、`[1]=contents`、`[3]=generationConfig`、`[4]` 留给脚本注入 WAA proof、`[5]=systemInstruction`、`[10]=1`、`[13]=时区`；
@@ -49,15 +68,15 @@ wire 编解码按 [AI Studio 私有协议](https://github.com/Mag1cFall/AIStudio
 ```bash
 # Linux（CPA 主机上，需 gcc + Go 1.22+）
 cd cpa-plugin-pggo
-make build            # 产出 bin/pggo-v1.1.0.so
+make build            # 产出 bin/pggo-v1.1.1.so
 # 或直接
-CGO_ENABLED=1 go build -trimpath -buildmode=c-shared -ldflags "-s -w" -o pggo-v1.1.0.so .
+CGO_ENABLED=1 go build -trimpath -buildmode=c-shared -ldflags "-s -w" -o pggo-v1.1.1.so .
 ```
 
 Windows（装了 MinGW-w64 的机器）：
 
 ```powershell
-$env:CGO_ENABLED=1; go build -trimpath -buildmode=c-shared -ldflags "-s -w" -o pggo-v1.1.0.dll .
+$env:CGO_ENABLED=1; go build -trimpath -buildmode=c-shared -ldflags "-s -w" -o pggo-v1.1.1.dll .
 ```
 
 **没有 gcc？用 Docker 出 Linux 版**（`Dockerfile.build`，已锁 `GOAMD64=v1`）：
@@ -71,7 +90,7 @@ docker build -f Dockerfile.build --output type=local,dest=bin/linux-amd64 .
 **不支持 Alpine/musl 环境**：Go c-shared 库在 musl 上无法被 dlopen（实测段错误 / TLS 重定位错误）。
 可在 CPA 容器里 `ldd --version 2>&1 | head -1` 确认，输出含 `GLIBC` 即可用。
 
-> 插件目录下的文件名决定 ID 与版本：`pggo-v1.1.0.so` → ID `pggo`、版本 `1.1.0`。
+> 插件目录下的文件名决定 ID 与版本：`pggo-v1.1.1.so` → ID `pggo`、版本 `1.1.1`。
 > CI 交叉编译时记得锁指令集基线：`GOAMD64=v1 CGO_CFLAGS="-march=x86-64"`，否则老 CPU 上会 SIGILL。
 
 ## 安装
@@ -89,12 +108,23 @@ plugins:
 
 商店会从本仓库 Release 下载 `pggo_<版本>_linux_amd64.zip` 并用 `checksums.txt` 校验。
 
+**热更新（商店内升级、不重启 CPA）**：CPA 先对旧实例调 `plugin.quiesce`，成功后才加载新实例（`internal/pluginhost/host.go` 324 起）。c-shared 库不会被卸载，
+每个版本有自己的 Go 运行时，所以旧实例必须主动交出端口。v1.1.1 起：
+
+- 收到 `plugin.quiesce`（或 `plugin.shutdown` / C ABI shutdown）时同步关闭监听、以 `1001` 断开所有 WS（脚本自动重连到新实例）、进行中的请求立即以 `503 hub_restarting` 失败；
+  之后只有 `plugin.register` / `plugin.reconfigure`（CPA 在新版本加载失败回滚时会对旧实例再调 `plugin.register`）会重新拉起中枢，其它调用不会。
+- 新实例绑定时若端口仍被占用，会在后台重试（前 60s 每秒一次，之后每 15s 一次，日志每分钟至多一条），旧实例释放后自动接管；静默/关闭/改 `listen` 会取消重试。
+- `GET /api/pg/status` 带 `version` 字段，可确认当前接管端口的是哪个版本。
+
+> ⚠ **从 ≤ 1.1.0 升级需要重启一次 CPA**：旧实例不认识 `plugin.quiesce`（CPA 视为「不支持」并继续加载新实例），端口不会被释放；
+> 新实例会一直后台重试并每分钟打一条「仍无法绑定」日志，直到 CPA 重启。从 1.1.1 往后的升级不再需要重启。
+
 ### 方式二：手动放文件
 
 ```bash
 # CPA 的 plugins 目录（config.yaml 里的 plugins.dir，默认 ./plugins）
 mkdir -p plugins/linux/amd64
-cp bin/linux-amd64/pggo.so plugins/linux/amd64/pggo-v1.1.0.so
+cp bin/linux-amd64/pggo.so plugins/linux/amd64/pggo-v1.1.1.so
 ```
 
 ## 配置
@@ -139,6 +169,7 @@ plugins:
 > 「`<前缀>/<模型>`」的剥离只发生在**所选凭证自身配置了 `prefix`** 时（`sdk/cliproxy/auth/conductor_models.go` `rewriteModelForAuth`），插件静态执行器没有凭证前缀，
 > 所以 `pg/gemini-x` 会原样交给插件，由插件自己剥前缀。注意两点：① 不要给 CPA 里其它凭证配置名为 `pg` / `pggo` 的 `prefix`，否则它们注册的 `pg/<模型>` 会与本插件同名混在一起；
 > ② Gemini 原生路由（`/v1beta/models/{model}:generateContent`）把模型放在 URL 路径里，含 `/` 的模型名不适合走这条入口，用 OpenAI / Claude 兼容入口（模型在 body 里）即可。
+> v1.1.1 起请求经 `model_router` 直达执行器（不经凭证选择），模型名原样传入，上述凭证前缀剥离不再涉及本插件。
 > 以上为源码静态核对，未在运行中的 CPA 上实测；保守起见默认值仍是 `pg-` / `pggo-`。
 
 > ⚠ CPA 只把 `plugins.configs.pggo` **这一节**下发给插件，**不会继承顶层 `api-keys`**。
@@ -210,8 +241,19 @@ location /api/robin/ { proxy_pass http://127.0.0.1:8788; proxy_read_timeout 1800
 | `PGGO_STATE_DIR` | `/state` | 轮换 Cookie 的保存目录（需可写，挂命名卷）；设为空串关闭持久化 |
 | `PGGO_STATE_SAVE_MIN` | `10` | 注册后保存 Cookie 状态的间隔（分钟） |
 | `PGGO_DRAIN_SEC` | `60` | Cookie 更新重启前等待进行中请求的上限 |
+| `PGGO_PROXY` | 空（直连） | 浏览器出口代理，如 `http://singbox:2080`、`socks5://singbox:2080`；可带 `http://user:pass@host:port`（Chromium 不支持带认证的 SOCKS）。日志只打印协议/主机/端口 |
+| `PGGO_PROXY_BYPASS` | 空 | 额外直连的主机（逗号/分号/空白分隔，支持 `.example.com`、CIDR）；`127.0.0.1,localhost,[::1]` 总是直连 |
+| `PGGO_PROXY_CHECK` | `1` | 启动时经代理从 Node 侧取一次 `https://ipinfo.io/json` 并记录出口 IP/国家/组织（失败只记日志）；`0` 关闭 |
 
 `PGGO_WS_URL` 里的 `channel` 参数总是被强制改成 `headless`，worker 不可能注册到 page 通道去顶掉你的真实浏览器。
+
+**出口代理（`PGGO_PROXY`）**：Google 会拒绝部分数据中心出口（`403 The caller does not have permission`），可让浏览器流量经住宅/其它出口代理。要点：
+
+- 代理设在**浏览器上下文级**（CDP `Target.createBrowserContext`）。没有用启动级代理，是因为 Playwright 对启动级 `socks5` 会附加
+  `--host-resolver-rules="MAP * ~NOTFOUND , EXCLUDE <代理主机>"`，连直连的 `127.0.0.1` 也会解析失败。
+- Playwright 默认**强制环回地址也走代理**（bypass 里不含环回主机时追加 `<-loopback>`），而页面连的正是 `ws://127.0.0.1:<端口>`（worker 的环回转发）。
+  所以 bypass 里总是显式带上 `127.0.0.1,localhost,[::1]`。中枢 WS 本身由 worker 的 Node 侧 TCP 转发到 `cliproxy:8788`，不经过浏览器代理。
+- 已用本地 CONNECT 代理跑 `TestHeadlessWorkerIntegration` 验证：代理只看到 `ipinfo.io`、`aistudio.google.com` 等外部目标，没有任何到中枢端口的连接，headless 通道正常注册并收发请求。
 
 **`xvfb` 还是 `new`？** 默认 `xvfb`。这条链路成败取决于页面里的 BotGuard/WAA proof，有头浏览器是与真实用户差异最小的形态；
 Chromium「新 headless」已与有头共用同一内核，差异很小，但仍有少量 headless 特有信号。代价是镜像多一个 `xvfb` 包（约 +10–20MB）、运行时多一个 Xvfb 进程（约 +20–50MB 内存）。
@@ -236,15 +278,41 @@ services:
       PGGO_SCRIPT_PATH: /app/userscript.user.js
       PGGO_HEADLESS_MODE: xvfb
       PGGO_COOKIE_LABEL: "you@gmail.com"   # 强烈建议：明确用哪个账号的推送
+      PGGO_PROXY: "socks5://singbox:2080"  # 可选：浏览器出口代理（见下方 sing-box 示例）
+      # PGGO_PROXY_BYPASS: "cliproxy"      # 可选：额外直连的内部主机；环回总是直连
     volumes:
       - ./pggo/data/cookies:/data/cookies:ro                                   # = 插件 data_dir/cookies
       - pggo-headless-state:/state                                             # 轮换后的 Cookie（worker 可写）
       - "./pggo/Catiecli Playground Executor.user.js:/app/userscript.user.js:ro"
     networks: [default]                     # 与 cliproxy 同一网络；不对外发布端口
-    depends_on: [cliproxy]
+    depends_on: [cliproxy, singbox]
+
+  # 可选：sing-box 客户端做出口代理。mixed 入站同时提供 HTTP 与 SOCKS5，只在内部网络可达，不发布端口。
+  singbox:
+    image: ghcr.io/sagernet/sing-box:latest  # 建议固定到具体版本
+    restart: unless-stopped
+    command: ["run", "-c", "/etc/sing-box/config.json"]
+    volumes:
+      - ./singbox/config.json:/etc/sing-box/config.json:ro
+    networks: [default]
 
 volumes:
   pggo-headless-state:
+```
+
+`./singbox/config.json` 示例（出站换成你自己的节点；`listen: 0.0.0.0` 只在 compose 内部网络生效，因为没有 `ports:`）：
+
+```json
+{
+  "log": { "level": "warn" },
+  "inbounds": [
+    { "type": "mixed", "tag": "in", "listen": "0.0.0.0", "listen_port": 2080 }
+  ],
+  "outbounds": [
+    { "type": "socks", "tag": "exit", "server": "<出口节点>", "server_port": 1080 }
+  ],
+  "route": { "final": "exit" }
+}
 ```
 
 > v1.1.0 之前推送的旧文件是 0600，需要重新推送一次（或手动 `chmod 640`、目录 `chmod 750`）worker 才读得到。
@@ -291,7 +359,7 @@ curl https://your.domain.example/v1/chat/completions \
 
 ```bash
 curl https://your.domain.example/api/pg/status
-# {"online":true,"connected_at":1795178734,"pending":0,"models":[...],
+# {"version":"1.1.1","online":true,"connected_at":1795178734,"pending":0,"models":[...],
 #  "channels":{"page":{"online":true,"connected_at":1795178734},"headless":{"online":false}}}
 
 curl -X POST https://your.domain.example/api/pg/exec \
@@ -318,6 +386,8 @@ curl -X POST https://your.domain.example/api/pg/exec \
 | 现象 | 定位 |
 |---|---|
 | `/v1/models` 没有 `pg-*` | 插件没加载：看 CPA 启动日志有没有 `plugin` 报错；文件名必须叫 `pggo-v<版本>.so` |
+| 模型列表有、请求 503 `auth_not_found` | 插件 ≤ 1.1.0（没有 `model_router`）→ 升级到 1.1.1；或 CPA 开了 Home 模式 / 走的是 Claude 原生入口（见「为什么需要 model_router」） |
+| 热更新后 `bind: address already in use` / 「仍无法绑定」 | 旧实例是 ≤ 1.1.0，不会释放端口：重启一次 CPA；`/api/pg/status` 的 `version` 可确认接管者 |
 | 模型列表有、请求 503 `executor_offline` | 报错里点名的通道没有执行器：看 `/api/pg/status` 的 `channels`；page 查 `listen` 端口和反代，headless 查 worker 容器日志 |
 | 请求 502 `upstream_not_json` | 页面拿到了非 200（proof/headers 没就绪），面板日志里有具体上游错误 |
 | 页面反复 4008 断开 | 面板 Key 不在执行器 Key 里（`plugins.configs.pggo.api-keys` ∪ JSON `api_keys`；CPA 顶层 `api-keys` **不会**自动继承） |
@@ -331,5 +401,7 @@ CGO_ENABLED=0 go test -count=1 ./...
 
 Go 侧用例覆盖：wire 形状（含 proof 槽位、时区路径、generationConfig 下标）、真实帧解码（正文/思考/usage/流尾错误）、
 SSE 收尾、YAML 配置抽取、WS 注册鉴权（4008）、顶替（4001）、分块补发拼接、`/api/pg/exec` 全链路、推送与绑定存档。
+v1.1.1 新增：注册载荷形态（`model_router` + `static` 执行器、无 `auth_provider`）、`model.route` 按 CPA 真实编码路由、`plugin.quiesce` 释放端口后第二个中枢可绑定同端口且 WS 收到 1001、
+端口占用时后台重试并在释放后接管、静默/关闭/改地址取消重试；worker 侧代理配置解析（含环回直连与 bypass 合并）与出口自检。
 v1.1.0 新增：双通道同 Key 共存与通道内顶替、按前缀路由（含 `pg/` 与 `pggo/`、互为前缀的最长匹配）、离线通道 503、status JSON（未连接不输出零值时间）、前缀面板字段解析与双套注册。
 无头 worker 的单元测试见 `headless/test/lib.test.js`（`npm test`）。
