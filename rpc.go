@@ -311,11 +311,11 @@ func registrationPayload() registration {
 				{Name: "config_file", Type: "string", Description: "可选：JSON 配置文件路径（高级项 model_map/timezone 等）；面板字段非空时优先"},
 			},
 		},
+		// executor_model_scope=static：执行器只服务无认证的静态模型（宿主 executorPluginReady 要求允许静态模型）
 		Capabilities: capabilities{
 			ModelRegistrar:        true,
 			ModelRouter:           true,
 			Executor:              true,
-			// static：执行器只服务无认证的静态模型（宿主 executorPluginReady 要求允许静态模型）
 			ExecutorModelScope:    "static",
 			ExecutorInputFormats:  []string{"chat-completions"},
 			ExecutorOutputFormats: []string{"chat-completions"},
