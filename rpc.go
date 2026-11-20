@@ -441,6 +441,17 @@ func handleRPC(method string, request []byte) (out []byte, rc int) {
 	case "plugin.register", "plugin.reconfigure":
 		applyConfig(request)
 		return okEnvelope(registrationPayload()), 0
+	case "plugin.quiesce":
+		// CPA 热更新时先对旧实例调用（internal/pluginhost/host.go callQuiesceWithOutcome），
+		// 成功后才加载新实例并对其 plugin.register。c-shared 库不会被卸载，旧实例必须在此
+		// 同步交出端口，否则新实例绑定失败。若新实例加载失败，CPA 会对旧实例再调
+		// plugin.register 回滚，届时 ensureHub 重新拉起中枢。
+		stopHub("plugin quiescing")
+		logf("已静默：中枢端口已释放，WS 已以 1001 断开")
+		return okEnvelope(struct{}{}), 0
+	case "plugin.shutdown":
+		shutdownHub()
+		return okEnvelope(struct{}{}), 0
 	case "executor.identifier":
 		return okEnvelope(map[string]string{"identifier": "pggo"}), 0
 	case "model.register":

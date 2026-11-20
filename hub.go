@@ -17,6 +17,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -63,30 +64,75 @@ func channelLabel(ch string) string {
 type hub struct {
 	mu      sync.Mutex
 	cfg     pluginConfig
-	conns   map[string]*wsConn
+	conns   map[string]*wsConn   // 每通道当前已注册的执行器
+	ws      map[*wsConn]struct{} // 所有已升级的 WS 连接（含未注册的），关闭中枢时逐一断开
 	connAt  map[string]time.Time
 	pending map[string]*waiter
 	srv     *http.Server
 	ln      net.Listener
+	closed  bool
 }
 
 func newHub(c pluginConfig) *hub {
 	return &hub{
 		cfg:     c,
 		conns:   make(map[string]*wsConn),
+		ws:      make(map[*wsConn]struct{}),
 		connAt:  make(map[string]time.Time),
 		pending: make(map[string]*waiter),
 	}
 }
 
+// 全局中枢状态。锁顺序：hubMu → hub.mu（反向会死锁）。
+// theHub 与 hubRetry 至多一个非 nil：要么已在监听，要么在后台等端口释放。
 var (
-	hubMu  sync.Mutex
-	theHub *hub
+	hubMu    sync.Mutex
+	theHub   *hub
+	hubRetry *bindRetry
 )
 
+// 端口被占用时的重绑节奏：前 bindRetryFastWindow 内每 bindRetryFast 一次，之后每
+// bindRetrySlow 一次；失败日志至多每 bindRetryLogEvery 一条。测试里会调小。
+var (
+	bindRetryFast       = time.Second
+	bindRetryFastWindow = 60 * time.Second
+	bindRetrySlow       = 15 * time.Second
+	bindRetryLogEvery   = time.Minute
+)
+
+// bindRetry 是一次后台重绑：h 是尚未监听的新中枢；stop 只由把它从 hubRetry 摘下的一方
+// 关闭（唯一所有者，不会重复 close）；done 在协程退出时关闭。
+type bindRetry struct {
+	h    *hub
+	addr string
+	stop chan struct{}
+	done chan struct{}
+	// 创建时拷贝的节奏参数：协程不读全局变量（被放弃的协程不会被等待，读全局会与测试改参数竞争）
+	fast, fastWindow, slow, logEvery time.Duration
+}
+
+// ensureHub 按配置启动/更新中枢。只由 plugin.register / plugin.reconfigure 调用——这两者
+// 也是 CPA 重新激活已静默实例的方式（热更新失败回滚时会对旧实例再调 plugin.register），
+// 所以静默（plugin.quiesce）后只有它们会重新拉起中枢，其它 RPC 不会。
 func ensureHub(c pluginConfig) {
 	hubMu.Lock()
 	defer hubMu.Unlock()
+	if r := hubRetry; r != nil {
+		r.h.mu.Lock()
+		sameAddr := r.addr == c.Listen
+		if sameAddr {
+			r.h.cfg = c
+		}
+		r.h.mu.Unlock()
+		if sameAddr {
+			return
+		}
+		// 地址变了：放弃旧地址的重试。不在持锁时等协程退出（它装载时要拿 hubMu）；
+		// 协程装载前会发现自己已被摘下，自行关掉刚绑上的端口。
+		logf("中枢监听地址变更 %s → %s，停止对旧地址的重试", r.addr, c.Listen)
+		hubRetry = nil
+		close(r.stop)
+	}
 	if theHub != nil {
 		theHub.mu.Lock()
 		sameAddr := theHub.cfg.Listen == c.Listen
@@ -105,11 +151,82 @@ func ensureHub(c pluginConfig) {
 	}
 	h := newHub(c)
 	if err := h.start(); err != nil {
-		logf("中枢启动失败（%s）: %v", c.Listen, err)
+		if !isAddrInUse(err) {
+			logf("中枢启动失败（%s）: %v", c.Listen, err)
+			return
+		}
+		// 典型场景：插件热更新时旧实例（≤1.1.0 不支持 plugin.quiesce）仍占着端口。
+		logf("中枢端口 %s 被占用，后台重试绑定（旧实例释放端口后自动接管）", c.Listen)
+		r := &bindRetry{
+			h: h, addr: c.Listen, stop: make(chan struct{}), done: make(chan struct{}),
+			fast: bindRetryFast, fastWindow: bindRetryFastWindow, slow: bindRetrySlow, logEvery: bindRetryLogEvery,
+		}
+		hubRetry = r
+		go r.run()
 		return
 	}
 	theHub = h
 	logf("中枢已启动 %s（脚本分发 /api/pg/script.user.js，WS /api/pg/ws）", c.Listen)
+}
+
+// isAddrInUse 识别「端口被占用」：Linux/macOS 为 EADDRINUSE，Windows 为 WSAEADDRINUSE(10048)。
+func isAddrInUse(err error) bool {
+	var errno syscall.Errno
+	if !errors.As(err, &errno) {
+		return false
+	}
+	return errno == syscall.EADDRINUSE || errno == 10048
+}
+
+func (r *bindRetry) run() {
+	defer close(r.done)
+	defer func() {
+		// 本库跑在 CPA 进程里，协程 panic 会带走整个宿主
+		if p := recover(); p != nil {
+			logf("中枢重绑协程异常（已停止重试）: %v", p)
+		}
+	}()
+	started := time.Now()
+	lastLog := started // ensureHub 刚记过一条，下一条至少隔 logEvery
+	timer := time.NewTimer(r.fast)
+	defer timer.Stop()
+	for {
+		select {
+		case <-r.stop:
+			return
+		case <-timer.C:
+		}
+		ln, err := net.Listen("tcp", r.addr)
+		if err == nil {
+			if r.install(ln) {
+				logf("中枢已启动 %s（端口释放后重绑成功，等待 %s）", r.addr, time.Since(started).Round(time.Second))
+			}
+			return
+		}
+		if now := time.Now(); now.Sub(lastLog) >= r.logEvery {
+			lastLog = now
+			logf("中枢仍无法绑定 %s（已等待 %s）: %v；若一直如此请重启 CPA", r.addr, now.Sub(started).Round(time.Second), err)
+		}
+		delay := r.fast
+		if time.Since(started) >= r.fastWindow {
+			delay = r.slow
+		}
+		timer.Reset(delay)
+	}
+}
+
+// install 在仍是当前重试时把监听交给中枢并设为 theHub；已被取消则关掉端口。
+func (r *bindRetry) install(ln net.Listener) bool {
+	hubMu.Lock()
+	defer hubMu.Unlock()
+	if hubRetry != r {
+		_ = ln.Close()
+		return false
+	}
+	hubRetry = nil
+	r.h.serve(ln)
+	theHub = r.h
+	return true
 }
 
 func activeHub() *hub {
@@ -118,13 +235,25 @@ func activeHub() *hub {
 	return theHub
 }
 
-func shutdownHub() {
+// shutdownHub 用于 C ABI shutdown 与 plugin.shutdown。
+func shutdownHub() { stopHub("plugin shutdown") }
+
+// stopHub 释放监听端口、以 1001 断开全部 WS（脚本会自动重连到接管端口的新实例）、
+// 立即失败所有进行中的请求，并取消后台重绑。返回时端口已释放、重绑协程已退出。
+// 用于 plugin.quiesce（热更新前 CPA 对旧实例调用）与 shutdown。
+func stopHub(reason string) {
 	hubMu.Lock()
 	h := theHub
 	theHub = nil
+	r := hubRetry
+	hubRetry = nil
 	hubMu.Unlock()
+	if r != nil {
+		close(r.stop)
+		<-r.done // 已释放 hubMu，协程的 install 不会被卡住
+	}
 	if h != nil {
-		h.close()
+		h.closeWith(reason)
 	}
 }
 
@@ -135,10 +264,16 @@ func (h *hub) config() pluginConfig {
 }
 
 func (h *hub) start() error {
-	ln, err := net.Listen("tcp", h.cfg.Listen)
+	ln, err := net.Listen("tcp", h.config().Listen)
 	if err != nil {
 		return err
 	}
+	h.serve(ln)
+	return nil
+}
+
+// serve 在已绑定的监听上启动 HTTP 服务。
+func (h *hub) serve(ln net.Listener) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/pg/ws", h.serveWS)
 	mux.HandleFunc("/api/pg/script.user.js", h.serveScript)
@@ -146,29 +281,32 @@ func (h *hub) start() error {
 	mux.HandleFunc("/api/pg/exec", h.serveExec)
 	mux.HandleFunc("/api/pggo/push", h.servePush)
 	mux.HandleFunc("/api/robin/bind-by-key", h.serveRobin)
+	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 15 * time.Second}
+	h.mu.Lock()
 	h.ln = ln
-	h.srv = &http.Server{Handler: mux, ReadHeaderTimeout: 15 * time.Second}
+	h.srv = srv
+	h.mu.Unlock()
 	go func() {
-		if err := h.srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			logf("中枢 HTTP 退出: %v", err)
 		}
 	}()
-	return nil
 }
 
-func (h *hub) close() {
-	if h.srv != nil {
-		_ = h.srv.Close()
-	}
-	if h.ln != nil {
-		_ = h.ln.Close()
-	}
-	// 已被劫持的 WS 连接不归 http.Server 管，需手动断开；1001 不在脚本的
-	// 「不重连」名单里，页面会自动重连。
+func (h *hub) close() { h.closeWith("hub restarting") }
+
+// closeWith 关闭中枢（可重复调用）。
+func (h *hub) closeWith(reason string) {
 	h.mu.Lock()
-	conns := make([]*wsConn, 0, len(h.conns))
-	for ch, conn := range h.conns {
+	h.closed = true
+	srv, ln := h.srv, h.ln
+	// 已被劫持的 WS 连接不归 http.Server 管，需手动断开（含尚未注册的）；1001 不在脚本的
+	// 「不重连」名单里，页面会自动重连。
+	conns := make([]*wsConn, 0, len(h.ws))
+	for conn := range h.ws {
 		conns = append(conns, conn)
+	}
+	for ch := range h.conns {
 		delete(h.conns, ch)
 	}
 	rids := make([]string, 0, len(h.pending))
@@ -176,12 +314,19 @@ func (h *hub) close() {
 		rids = append(rids, rid)
 	}
 	h.mu.Unlock()
-	for _, conn := range conns {
-		_ = conn.writeClose(1001, "hub restarting")
-		conn.shutdown()
+	if srv != nil {
+		_ = srv.Close() // 同时关闭监听
 	}
+	if ln != nil {
+		_ = ln.Close()
+	}
+	// 先结束请求再断连接：调用方拿到确定的 hub_restarting，而不是断线竞态下的 executor_disconnected
 	for _, rid := range rids {
-		h.finish(nil, rid, rpcErrf(http.StatusServiceUnavailable, "hub_restarting", "执行器中枢重启，请重试"))
+		h.finish(nil, rid, rpcErrf(http.StatusServiceUnavailable, "hub_restarting", "执行器中枢重启/停止，请重试"))
+	}
+	for _, conn := range conns {
+		_ = conn.writeClose(1001, reason)
+		conn.shutdown()
 	}
 }
 
@@ -339,6 +484,7 @@ func (h *hub) serveStatus(w http.ResponseWriter, r *http.Request) {
 	pending := len(h.pending)
 	h.mu.Unlock()
 	out := map[string]any{
+		"version":  pluginVersion,
 		"online":   anyOnline,
 		"pending":  pending,
 		"models":   h.config().Models,
@@ -549,6 +695,20 @@ func (h *hub) serveWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer conn.shutdown()
+	// 登记连接；与 closeWith 竞态、中枢已关闭时直接 1001 断开
+	h.mu.Lock()
+	if h.closed {
+		h.mu.Unlock()
+		_ = conn.writeClose(1001, "hub closed")
+		return
+	}
+	h.ws[conn] = struct{}{}
+	h.mu.Unlock()
+	defer func() {
+		h.mu.Lock()
+		delete(h.ws, conn)
+		h.mu.Unlock()
+	}()
 
 	var authed bool
 	for {
