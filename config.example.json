@@ -4,6 +4,7 @@
   "data_dir": "/opt/cliproxyapi/pggo/data",
   "api_keys": [],
   "model_prefix": "pg-",
+  "headless_model_prefix": "pggo-",
   "models": ["gemini-3.8-flash", "gemini-3.6-flash", "gemini-2.5-pro", "gemini-2.5-flash"],
   "model_map": {},
   "timezone": "Asia/Shanghai",
