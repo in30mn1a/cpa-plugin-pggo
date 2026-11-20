@@ -30,14 +30,52 @@ type waiter struct {
 	err    error
 }
 
+// 执行器通道：page = 真实浏览器页面（WS 不带 channel 参数，向后兼容）；
+// headless = 云端无头 worker（WS 带 ?channel=headless）。
+// 每个通道各占一个执行器槽位，顶替（4001）只发生在同一通道内。
+const (
+	channelPage     = "page"
+	channelHeadless = "headless"
+)
+
+var channels = []string{channelPage, channelHeadless}
+
+// parseChannel 把 WS 查询参数映射为通道名；未知值返回 ok=false。
+func parseChannel(raw string) (string, bool) {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "", channelPage:
+		return channelPage, true
+	case channelHeadless:
+		return channelHeadless, true
+	default:
+		return "", false
+	}
+}
+
+func channelLabel(ch string) string {
+	if ch == channelHeadless {
+		return "无头执行器"
+	}
+	return "页面执行器"
+}
+
 type hub struct {
 	mu      sync.Mutex
 	cfg     pluginConfig
-	conn    *wsConn
-	connAt  time.Time
+	conns   map[string]*wsConn
+	connAt  map[string]time.Time
 	pending map[string]*waiter
 	srv     *http.Server
 	ln      net.Listener
+}
+
+func newHub(c pluginConfig) *hub {
+	return &hub{
+		cfg:     c,
+		conns:   make(map[string]*wsConn),
+		connAt:  make(map[string]time.Time),
+		pending: make(map[string]*waiter),
+	}
 }
 
 var (
@@ -64,7 +102,7 @@ func ensureHub(c pluginConfig) {
 		theHub.close()
 		theHub = nil
 	}
-	h := &hub{cfg: c, pending: make(map[string]*waiter)}
+	h := newHub(c)
 	if err := h.start(); err != nil {
 		logf("中枢启动失败（%s）: %v", c.Listen, err)
 		return
@@ -127,14 +165,17 @@ func (h *hub) close() {
 	// 已被劫持的 WS 连接不归 http.Server 管，需手动断开；1001 不在脚本的
 	// 「不重连」名单里，页面会自动重连。
 	h.mu.Lock()
-	conn := h.conn
-	h.conn = nil
+	conns := make([]*wsConn, 0, len(h.conns))
+	for ch, conn := range h.conns {
+		conns = append(conns, conn)
+		delete(h.conns, ch)
+	}
 	rids := make([]string, 0, len(h.pending))
 	for rid := range h.pending {
 		rids = append(rids, rid)
 	}
 	h.mu.Unlock()
-	if conn != nil {
+	for _, conn := range conns {
 		_ = conn.writeClose(1001, "hub restarting")
 		conn.shutdown()
 	}
@@ -156,14 +197,19 @@ func (h *hub) keyValid(key string) bool {
 	return false
 }
 
-// dispatch 把一次上游请求投给在线页面执行器，等它把上游原文拼完。
-func (h *hub) dispatch(model string, wire []any, binding string) (string, error) {
+// dispatch 把一次上游请求投给指定通道的在线执行器，等它把上游原文拼完。
+// 目标通道离线时直接 503，不静默回落到其它通道。
+func (h *hub) dispatch(channel, model string, wire []any, binding string) (string, error) {
 	h.mu.Lock()
-	conn := h.conn
+	conn := h.conns[channel]
 	if conn == nil || conn.isClosed() {
 		h.mu.Unlock()
+		if channel == channelHeadless {
+			return "", rpcErrf(http.StatusServiceUnavailable, "executor_offline",
+				"通道 headless 没有在线执行器：请检查无头 worker 是否运行并连上 WS（?channel=headless）")
+		}
 		return "", rpcErrf(http.StatusServiceUnavailable, "executor_offline",
-			"没有在线页面执行器：请用浏览器打开 AI Studio 页面并让脚本连上 WS")
+			"通道 page 没有在线页面执行器：请用浏览器打开 AI Studio 页面并让脚本连上 WS")
 	}
 	rid := newID()
 	w := &waiter{done: make(chan struct{})}
@@ -188,7 +234,7 @@ func (h *hub) dispatch(model string, wire []any, binding string) (string, error)
 		"requestBody": string(requestBody),
 	})
 	if err := conn.writeText(msg); err != nil {
-		return "", rpcErrf(http.StatusBadGateway, "executor_send_failed", "推送到页面失败: %v", err)
+		return "", rpcErrf(http.StatusBadGateway, "executor_send_failed", "推送到%s失败: %v", channelLabel(channel), err)
 	}
 
 	select {
@@ -200,7 +246,7 @@ func (h *hub) dispatch(model string, wire []any, binding string) (string, error)
 	case <-time.After(timeout):
 		_ = conn.writeText(mustJSON(map[string]any{"type": "cancel", "requestId": rid}))
 		return "", rpcErrf(http.StatusGatewayTimeout, "executor_timeout",
-			"页面执行器 %d 秒内没有回结果（页面可能被后台冻结）", int(timeout.Seconds()))
+			"%s %d 秒内没有回结果（页面可能被后台冻结）", channelLabel(channel), int(timeout.Seconds()))
 	}
 }
 
@@ -245,18 +291,38 @@ func (h *hub) serveScript(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(raw)
 }
 
+// serveStatus 报告各通道在线状态。顶层 online 表示「任一通道在线」（兼容旧版）；
+// connected_at 取各通道最近一次注册时间，从未连接过则省略该字段。
 func (h *hub) serveStatus(w http.ResponseWriter, r *http.Request) {
 	h.mu.Lock()
-	online := h.conn != nil && !h.conn.isClosed()
-	connAt := h.connAt
+	anyOnline := false
+	var latest time.Time
+	chans := make(map[string]any, len(channels))
+	for _, ch := range channels {
+		conn := h.conns[ch]
+		online := conn != nil && !conn.isClosed()
+		anyOnline = anyOnline || online
+		entry := map[string]any{"online": online}
+		if at := h.connAt[ch]; !at.IsZero() {
+			entry["connected_at"] = at.Unix()
+			if at.After(latest) {
+				latest = at
+			}
+		}
+		chans[ch] = entry
+	}
 	pending := len(h.pending)
 	h.mu.Unlock()
-	writeJSON(w, http.StatusOK, map[string]any{
-		"online":       online,
-		"connected_at": connAt.Unix(),
-		"pending":      pending,
-		"models":       h.config().Models,
-	})
+	out := map[string]any{
+		"online":   anyOnline,
+		"pending":  pending,
+		"models":   h.config().Models,
+		"channels": chans,
+	}
+	if !latest.IsZero() {
+		out["connected_at"] = latest.Unix()
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 func (h *hub) serveExec(w http.ResponseWriter, r *http.Request) {
@@ -278,21 +344,22 @@ func (h *hub) serveExec(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":{"message":"body 不是 JSON"}}`, http.StatusBadRequest)
 		return
 	}
+	cfg := currentConfig()
+	channel, upstream := routeModel(cfg, body.Model)
 	if body.RequestJSON != "" {
-		cfg := currentConfig()
 		var chat chatRequest
 		if err := json.Unmarshal([]byte(body.RequestJSON), &chat); err != nil {
 			http.Error(w, `{"error":{"message":"request_json 不是 OpenAI chat JSON"}}`, http.StatusBadRequest)
 			return
 		}
-		wire, binding := buildWire(resolveUpstreamModel(cfg, body.Model), chat, cfg)
+		wire, binding := buildWire(upstream, chat, cfg)
 		body.Wire, body.Binding = wire, binding
 	}
 	if len(body.Wire) == 0 {
 		http.Error(w, `{"error":{"message":"缺 wire / request_json"}}`, http.StatusBadRequest)
 		return
 	}
-	raw, err := h.dispatch(body.Model, body.Wire, body.Binding)
+	raw, err := h.dispatch(channel, body.Model, body.Wire, body.Binding)
 	if err != nil {
 		writeJSON(w, http.StatusBadGateway, map[string]any{"error": map[string]any{"message": err.Error()}})
 		return
@@ -416,6 +483,11 @@ func mustJSON(v any) []byte {
 // ------------------------------------------------------------- WS 端点 ----
 
 func (h *hub) serveWS(w http.ResponseWriter, r *http.Request) {
+	channel, ok := parseChannel(r.URL.Query().Get("channel"))
+	if !ok {
+		http.Error(w, "unknown channel", http.StatusBadRequest)
+		return
+	}
 	conn, err := upgradeWebSocket(w, r)
 	if err != nil {
 		logf("WS 升级失败: %v", err)
@@ -454,9 +526,9 @@ func (h *hub) serveWS(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			h.mu.Lock()
-			prev := h.conn
-			h.conn = conn
-			h.connAt = time.Now()
+			prev := h.conns[channel]
+			h.conns[channel] = conn
+			h.connAt[channel] = time.Now()
 			h.mu.Unlock()
 			if prev != nil && prev != conn {
 				_ = prev.writeClose(4001, "replaced by new connection")
@@ -464,7 +536,7 @@ func (h *hub) serveWS(w http.ResponseWriter, r *http.Request) {
 			}
 			authed = true
 			_ = conn.writeText(mustJSON(map[string]any{"type": "registered", "executorType": "playground"}))
-			logf("页面执行器上线")
+			logf("%s上线（通道 %s）", channelLabel(channel), channel)
 		case "ping":
 			_ = conn.writeText(mustJSON(map[string]any{"type": "pong"}))
 		case "stream-chunk":
@@ -502,12 +574,12 @@ func (h *hub) serveWS(w http.ResponseWriter, r *http.Request) {
 	}
 
 	h.mu.Lock()
-	if h.conn == conn {
-		h.conn = nil
+	if h.conns[channel] == conn {
+		delete(h.conns, channel)
 	}
 	h.mu.Unlock()
 	if authed {
-		logf("页面执行器下线")
+		logf("%s下线（通道 %s）", channelLabel(channel), channel)
 	}
 }
 

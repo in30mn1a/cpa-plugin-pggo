@@ -53,16 +53,28 @@ func textOf(raw json.RawMessage) string {
 	return ""
 }
 
-func resolveUpstreamModel(c pluginConfig, requested string) string {
-	if mapped, ok := c.ModelMap[requested]; ok && mapped != "" {
-		return mapped
-	}
+// routeModel 按最长匹配前缀决定执行通道并剥掉该前缀：
+// <model_prefix> → page，<headless_model_prefix> → headless；
+// 都不匹配时走 page（兼容 model_map 里的裸名）。model_map 按完整请求名查。
+func routeModel(c pluginConfig, requested string) (channel, upstream string) {
+	channel = channelPage
 	name := requested
-	if c.ModelPrefix != "" {
-		name = strings.TrimPrefix(name, c.ModelPrefix)
+	matched := -1
+	for _, cand := range []struct{ prefix, channel string }{
+		{c.ModelPrefix, channelPage},
+		{c.HeadlessModelPrefix, channelHeadless},
+	} {
+		if cand.prefix == "" || !strings.HasPrefix(requested, cand.prefix) || len(cand.prefix) <= matched {
+			continue
+		}
+		matched = len(cand.prefix)
+		channel = cand.channel
+		name = strings.TrimPrefix(requested, cand.prefix)
 	}
-	name = strings.TrimPrefix(name, "models/")
-	return name
+	if mapped, ok := c.ModelMap[requested]; ok && mapped != "" {
+		return channel, mapped
+	}
+	return channel, strings.TrimPrefix(name, "models/")
 }
 
 // ------------------------------------------------------- 上游 wire 编码 ----

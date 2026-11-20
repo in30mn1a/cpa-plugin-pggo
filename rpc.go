@@ -52,27 +52,29 @@ func rpcErrf(status int, code, format string, a ...any) *rpcError {
 // ---------------------------------------------------------------- 配置 ----
 
 type pluginConfig struct {
-	Listen            string            `json:"listen"`
-	ScriptPath        string            `json:"script_path"`
-	DataDir           string            `json:"data_dir"`
-	APIKeys           []string          `json:"api_keys"`
-	ModelPrefix      string            `json:"model_prefix"`
-	Models            []string          `json:"models"`
-	ModelMap          map[string]string `json:"model_map"`
-	Timezone          string            `json:"timezone"`
-	MaxOutputTokens   int               `json:"max_output_tokens"`
-	RequestTimeoutSec int               `json:"request_timeout_sec"`
+	Listen              string            `json:"listen"`
+	ScriptPath          string            `json:"script_path"`
+	DataDir             string            `json:"data_dir"`
+	APIKeys             []string          `json:"api_keys"`
+	ModelPrefix         string            `json:"model_prefix"`
+	HeadlessModelPrefix string            `json:"headless_model_prefix"`
+	Models              []string          `json:"models"`
+	ModelMap            map[string]string `json:"model_map"`
+	Timezone            string            `json:"timezone"`
+	MaxOutputTokens     int               `json:"max_output_tokens"`
+	RequestTimeoutSec   int               `json:"request_timeout_sec"`
 }
 
 func defaultConfig() pluginConfig {
 	return pluginConfig{
-		Listen:            "127.0.0.1:8788",
-		DataDir:           "pggo-data",
-		ModelPrefix:       "pg-",
-		Models:            []string{"gemini-3.8-flash", "gemini-3.6-flash", "gemini-2.5-pro", "gemini-2.5-flash"},
-		Timezone:          "Asia/Shanghai",
-		MaxOutputTokens:   65536,
-		RequestTimeoutSec: 600,
+		Listen:              "127.0.0.1:8788",
+		DataDir:             "pggo-data",
+		ModelPrefix:         "pg-",
+		HeadlessModelPrefix: "pggo-",
+		Models:              []string{"gemini-3.8-flash", "gemini-3.6-flash", "gemini-2.5-pro", "gemini-2.5-flash"},
+		Timezone:            "Asia/Shanghai",
+		MaxOutputTokens:     65536,
+		RequestTimeoutSec:   600,
 	}
 }
 
@@ -109,9 +111,11 @@ func applyConfig(request []byte) {
 		}
 		// 面板字段（plugins.configs.pggo.*）非空时覆盖 JSON 配置
 		for key, dst := range map[string]*string{
-			"listen":      &next.Listen,
-			"script_path": &next.ScriptPath,
-			"data_dir":    &next.DataDir,
+			"listen":                &next.Listen,
+			"script_path":           &next.ScriptPath,
+			"data_dir":              &next.DataDir,
+			"model_prefix":          &next.ModelPrefix,
+			"headless_model_prefix": &next.HeadlessModelPrefix,
 		} {
 			if v := yamlScalar(yamlText, key); v != "" {
 				*dst = v
@@ -120,6 +124,9 @@ func applyConfig(request []byte) {
 		if models := yamlListBlock(yamlText, "models"); len(models) > 0 {
 			next.Models = models
 		}
+	}
+	if next.HeadlessModelPrefix == next.ModelPrefix {
+		logf("headless_model_prefix 与 model_prefix 相同（%q）：无头通道模型不注册，请改成不同前缀", next.ModelPrefix)
 	}
 	if len(next.APIKeys) == 0 {
 		logf("未配置任何执行器 Key：页面 register 将全部被 4008 拒绝（请在插件配置的 api-keys 中填写）")
@@ -220,7 +227,7 @@ func countIndent(s string) int {
 
 // ------------------------------------------------------------ 注册元数据 ----
 
-const pluginVersion = "1.0.1"
+const pluginVersion = "1.1.0"
 
 type configField struct {
 	Name        string   `json:"Name"`
@@ -266,7 +273,9 @@ func registrationPayload() registration {
 				{Name: "listen", Type: "string", Default: "127.0.0.1:8788", Description: "内嵌中枢监听地址；CPA 跑在 Docker 里需改为 0.0.0.0:8788 并映射端口。修改后自动重绑"},
 				{Name: "script_path", Type: "string", Description: "用户脚本文件路径（供 /api/pg/script.user.js 分发）；不填则不提供脚本分发"},
 				{Name: "data_dir", Type: "string", Default: "pggo-data", Description: "Cookie 推送 / Robin 绑定的落盘目录"},
-				{Name: "models", Type: "array", Description: "上游模型 ID 列表，注册为 pg-<ID>；不填使用内置默认列表"},
+				{Name: "models", Type: "array", Description: "上游模型 ID 列表，每个 ID 注册两次：<model_prefix><ID>（页面通道）与 <headless_model_prefix><ID>（无头通道）；不填使用内置默认列表"},
+				{Name: "model_prefix", Type: "string", Default: "pg-", Description: "页面通道（真实浏览器）模型前缀，如 pg- 或 pg/"},
+				{Name: "headless_model_prefix", Type: "string", Default: "pggo-", Description: "无头通道（云端 headless worker）模型前缀，如 pggo- 或 pggo/；须与 model_prefix 不同"},
 				{Name: "config_file", Type: "string", Description: "可选：JSON 配置文件路径（高级项 model_map/timezone 等）；面板字段非空时优先"},
 			},
 		},
@@ -296,19 +305,27 @@ type modelRegistration struct {
 	Models   []modelInfo `json:"Models"`
 }
 
+// modelRegistrationPayload 把 models 注册两遍：页面通道前缀一遍、无头通道前缀一遍。
+// 两个前缀相同时只注册页面通道（避免同名模型歧义）。
 func modelRegistrationPayload() modelRegistration {
 	c := currentConfig()
 	out := modelRegistration{Provider: "pggo"}
-	for _, m := range c.Models {
-		out.Models = append(out.Models, modelInfo{
-			ID:                         c.ModelPrefix + m,
-			Object:                     "model",
-			OwnedBy:                    "pggo",
-			DisplayName:                c.ModelPrefix + m,
-			SupportedGenerationMethods: []string{"chat"},
-			MaxCompletionTokens:        c.MaxOutputTokens,
-			UserDefined:                true,
-		})
+	prefixes := []string{c.ModelPrefix}
+	if c.HeadlessModelPrefix != c.ModelPrefix {
+		prefixes = append(prefixes, c.HeadlessModelPrefix)
+	}
+	for _, prefix := range prefixes {
+		for _, m := range c.Models {
+			out.Models = append(out.Models, modelInfo{
+				ID:                         prefix + m,
+				Object:                     "model",
+				OwnedBy:                    "pggo",
+				DisplayName:                prefix + m,
+				SupportedGenerationMethods: []string{"chat"},
+				MaxCompletionTokens:        c.MaxOutputTokens,
+				UserDefined:                true,
+			})
+		}
 	}
 	return out
 }
@@ -397,13 +414,13 @@ func run(request []byte) (*chatRequest, *upstreamResult, string, error) {
 		return nil, nil, "", rpcErrf(http.StatusBadRequest, "invalid_request", "请求体不是 OpenAI chat-completions JSON: %v", err)
 	}
 	c := currentConfig()
-	upstreamModel := resolveUpstreamModel(c, req.Model)
+	channel, upstreamModel := routeModel(c, req.Model)
 	wire, binding := buildWire(upstreamModel, chat, c)
 	h := activeHub()
 	if h == nil {
 		return nil, nil, "", rpcErrf(http.StatusServiceUnavailable, "hub_offline", "执行器中枢未启动")
 	}
-	raw, err := h.dispatch(upstreamModel, wire, binding)
+	raw, err := h.dispatch(channel, upstreamModel, wire, binding)
 	if err != nil {
 		return nil, nil, "", err
 	}

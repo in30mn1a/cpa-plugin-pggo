@@ -151,7 +151,7 @@ func startTestHub(t *testing.T) *hub {
 	cfg.ScriptPath = script
 	cfg.DataDir = dir
 	cfg.RequestTimeoutSec = 5
-	h := &hub{cfg: cfg, pending: make(map[string]*waiter)}
+	h := newHub(cfg)
 	if err := h.start(); err != nil {
 		t.Fatalf("启动测试中枢失败: %v", err)
 	}
@@ -190,7 +190,7 @@ func TestDispatchRoundTrip(t *testing.T) {
 	}
 	done := make(chan out, 1)
 	go func() {
-		raw, err := h.dispatch("gemini-3.8-flash", []any{"models/gemini-3.8-flash"}, "hi")
+		raw, err := h.dispatch(channelPage, "gemini-3.8-flash", []any{"models/gemini-3.8-flash"}, "hi")
 		done <- out{raw, err}
 	}()
 
@@ -388,7 +388,7 @@ func TestHTTPEndpointsAuthAndStores(t *testing.T) {
 
 func TestDispatchWithoutExecutor(t *testing.T) {
 	h := startTestHub(t)
-	if _, err := h.dispatch("m", []any{"x"}, "hi"); err == nil {
+	if _, err := h.dispatch(channelPage, "m", []any{"x"}, "hi"); err == nil {
 		t.Fatal("没有执行器时应报错")
 	} else if re, ok := err.(*rpcError); !ok || re.status != http.StatusServiceUnavailable {
 		t.Fatalf("应返回 503 语义错误，得到 %v", err)
