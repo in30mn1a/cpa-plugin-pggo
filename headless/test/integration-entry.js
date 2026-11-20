@@ -40,6 +40,20 @@ async function main() {
                     log("测试：访问了（桩）Google 登录页");
                     await route.fulfill({ status: 200, contentType: "text/html", body: "<html><body>login stub</body></html>" });
                 });
+                // 代理联调：PGGO_TEST_PROXY_PROBE_URL 指向只有测试代理认得的地址（如
+                // http://proxy-probe.example/），能打开即证明浏览器上下文的流量经过 PGGO_PROXY
+                const probe = process.env.PGGO_TEST_PROXY_PROBE_URL;
+                if (probe) {
+                    const p = await context.newPage();
+                    try {
+                        const resp = await p.goto(probe, { timeout: 30000 });
+                        log(`测试：代理探针 ${probe} → HTTP ${resp && resp.status()} ${(await p.textContent("body").catch(() => "")) || ""}`.trim());
+                    } catch (e) {
+                        log(`测试：代理探针失败: ${String(e.message).split(/\r?\n/)[0]}`);
+                    } finally {
+                        await p.close().catch(() => {});
+                    }
+                }
             },
         },
     });

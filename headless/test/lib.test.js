@@ -220,3 +220,81 @@ test("状态文件：同账号且派生自同一份推送才使用；新推送�
     assert.strictEqual(lib.loadState(path.join(dir, "missing.json"), push, pushMtimeMs), null);
     assert.deepStrictEqual(fs.readdirSync(dir), ["a@gmail.com.state.json"], "不应残留临时文件");
 });
+
+// Playwright 的 shouldProxyLoopback：bypass 中不含任何环回主机时会强制代理环回（追加 <-loopback>）
+function playwrightForcesLoopbackProxy(bypass) {
+    const hosts = (bypass || "").split(",").map((s) => s.trim());
+    return !["localhost", "127.0.0.1", "::1", "[::]", "[::1]", "<loopback>", "<-loopback>"].some((h) => hosts.includes(h));
+}
+
+test("proxyConfig：未设置时直连", () => {
+    assert.strictEqual(lib.proxyConfig("", "x"), null);
+    assert.strictEqual(lib.proxyConfig(undefined), null);
+    assert.match(lib.describeProxy(null), /直连/);
+});
+
+test("proxyConfig：http / socks5 / 无协议，环回总是直连且排在前面", () => {
+    for (const [raw, server] of [
+        ["http://singbox:2080", "http://singbox:2080"],
+        ["socks5://singbox:2080", "socks5://singbox:2080"],
+        ["socks5h://singbox:2080", "socks5://singbox:2080"],
+        ["singbox:2080", "http://singbox:2080"],
+        ["socks5://[::1]:1080", "socks5://[::1]:1080"],
+    ]) {
+        const p = lib.proxyConfig(raw);
+        assert.strictEqual(p.server, server, raw);
+        assert.strictEqual(p.bypass, "127.0.0.1,localhost,[::1]", raw);
+        assert.strictEqual(p.username, undefined);
+        assert.strictEqual(playwrightForcesLoopbackProxy(p.bypass), false, "环回不能被 Playwright 强制走代理");
+    }
+});
+
+test("proxyConfig：PGGO_PROXY_BYPASS 合并去重，支持逗号/分号/空白分隔", () => {
+    const p = lib.proxyConfig("http://singbox:2080", " cliproxy; .internal  10.0.0.0/8,localhost,cliproxy ");
+    assert.strictEqual(p.bypass, "127.0.0.1,localhost,[::1],cliproxy,.internal,10.0.0.0/8");
+});
+
+test("proxyConfig：凭据拆出，server 与日志不含凭据；SOCKS 认证与未知协议报错", () => {
+    const p = lib.proxyConfig("http://us%40er:p%3Ass@proxy.local:3128");
+    assert.deepStrictEqual(
+        { server: p.server, username: p.username, password: p.password },
+        { server: "http://proxy.local:3128", username: "us@er", password: "p:ss" },
+    );
+    const d = lib.describeProxy(p);
+    assert.ok(!d.includes("p:ss") && !d.includes("us@er") && d.includes("proxy.local:3128"), d);
+    assert.throws(() => lib.proxyConfig("socks5://u:p@singbox:2080"), /SOCKS/);
+    assert.throws(() => lib.proxyConfig("ftp://singbox:21"), /协议不支持/);
+    assert.throws(() => lib.proxyConfig("http://"), /PGGO_PROXY/);
+});
+
+test("readEnv 读取 PGGO_PROXY / PGGO_PROXY_BYPASS / PGGO_PROXY_CHECK", () => {
+    const { readEnv } = require("../src/worker");
+    const base = { PGGO_API_KEY: "k" };
+    assert.strictEqual(readEnv(base).proxy, null);
+    const cfg = readEnv({ ...base, PGGO_PROXY: "socks5://singbox:2080", PGGO_PROXY_BYPASS: "cliproxy" });
+    assert.deepStrictEqual(cfg.proxy, { server: "socks5://singbox:2080", bypass: "127.0.0.1,localhost,[::1],cliproxy" });
+    assert.strictEqual(cfg.proxyCheck, true);
+    assert.strictEqual(readEnv({ ...base, PGGO_PROXY: "http://h:1", PGGO_PROXY_CHECK: "0" }).proxyCheck, false);
+    assert.throws(() => readEnv({ ...base, PGGO_PROXY: "gopher://h:1" }), /协议不支持/);
+});
+
+test("proxySelfCheck 经代理请求 ipinfo，失败不抛出", async () => {
+    const { proxySelfCheck } = require("../src/worker");
+    const seen = [];
+    const fake = {
+        async newContext(opts) {
+            seen.push(opts.proxy);
+            return {
+                async get(url) {
+                    seen.push(url);
+                    return { ok: () => true, status: () => 200, json: async () => ({ ip: "203.0.113.9", country: "JP", org: "AS0 Test" }) };
+                },
+                async dispose() { seen.push("disposed"); },
+            };
+        },
+    };
+    const proxy = lib.proxyConfig("http://singbox:2080");
+    await proxySelfCheck(proxy, fake);
+    assert.deepStrictEqual(seen, [proxy, "https://ipinfo.io/json", "disposed"]);
+    await proxySelfCheck(proxy, { async newContext() { throw new Error("boom"); } });
+});

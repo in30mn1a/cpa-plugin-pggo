@@ -45,7 +45,30 @@ function readEnv(env = process.env) {
         stateDir: env.PGGO_STATE_DIR === undefined ? "/state" : env.PGGO_STATE_DIR,
         stateSaveMs: envInt("PGGO_STATE_SAVE_MIN", 10) * 60 * 1000,
         drainMs: envInt("PGGO_DRAIN_SEC", 60) * 1000,
+        proxy: lib.proxyConfig(env.PGGO_PROXY, env.PGGO_PROXY_BYPASS),
+        proxyCheck: env.PGGO_PROXY_CHECK !== "0",
     };
+}
+
+// ------------------------------------------------------------------ 出口自检 ----
+// 经同一代理从 Node 侧取 ipinfo.io，记录出口国家/组织，便于确认代理生效。失败只记日志。
+async function proxySelfCheck(proxy, request) {
+    let ctx;
+    try {
+        request = request || require("playwright").request;
+        ctx = await request.newContext({ proxy, timeout: 15000 });
+        const resp = await ctx.get("https://ipinfo.io/json", { timeout: 15000 });
+        if (!resp.ok()) {
+            log(`出口自检：ipinfo.io 返回 HTTP ${resp.status()}（不影响运行）`);
+            return;
+        }
+        const info = await resp.json();
+        log(`出口自检：${info.ip || "?"} ${info.country || "?"} ${info.org || ""}`.trim());
+    } catch (e) {
+        log("出口自检失败（不影响运行）: " + String(e && e.message || e).split("\n")[0]);
+    } finally {
+        if (ctx) await ctx.dispose().catch(() => {});
+    }
 }
 
 // ------------------------------------------------------------------ 环回转发 ----
@@ -244,7 +267,10 @@ class Session {
         const ctxOpts = lib.contextOptions(fp, { userAgent: ua, defaultTimezone: cfg.defaultTimezone });
         log(`浏览器 ${this.browser.version()}（${cfg.mode}）视口 ${ctxOpts.viewport.width}x${ctxOpts.viewport.height} 屏幕 ${ctxOpts.screen.width}x${ctxOpts.screen.height} ${ctxOpts.locale} ${ctxOpts.timezoneId}`);
 
-        this.context = await this.browser.newContext(ctxOpts);
+        // 代理设在上下文级（CDP Target.createBrowserContext 的 proxyServer/proxyBypassList）：
+        // 启动级的 socks5 代理会被 Playwright 附加 --host-resolver-rules="MAP * ~NOTFOUND"，
+        // 连直连的 127.0.0.1 也会解析失败；上下文级没有这个副作用。
+        this.context = await this.browser.newContext(cfg.proxy ? { ...ctxOpts, proxy: cfg.proxy } : ctxOpts);
         // 页面（公网 https 源）连 127.0.0.1 的环回转发属于 Local Network Access，
         // 新版 Chromium 需授权，无头下没有弹窗可点，这里只对 AI Studio 源预先授权。
         try {
@@ -451,11 +477,14 @@ class Session {
 }
 
 // --------------------------------------------------------------------- 主循环 ----
-async function runWorker(cfg, { chromium, extra, isStopping, onSession } = {}) {
+async function runWorker(cfg, { chromium, request, extra, isStopping, onSession } = {}) {
     chromium = chromium || require("playwright").chromium;
     if (!fs.existsSync(cfg.scriptPath)) throw new Error(`用户脚本不存在: ${cfg.scriptPath}`);
     const fwd = await startForwarder(cfg.wsUrl);
     log(`启动：模式 ${cfg.mode}，中枢 ${redactUrl(cfg.wsUrl)}，Cookie 目录 ${cfg.cookieDir}`);
+    // 中枢 WS 走 Node 侧 TCP 转发，不经过浏览器代理；页面只连 127.0.0.1（已在 bypass 中）
+    log(`出口代理 ${lib.describeProxy(cfg.proxy)}${cfg.proxy ? `，直连: ${cfg.proxy.bypass}` : ""}`);
+    if (cfg.proxy && cfg.proxyCheck) proxySelfCheck(cfg.proxy, request); // 不阻塞启动
     let backoff = 5000;
     let warnedFile = "";
     try {
@@ -560,6 +589,6 @@ async function main() {
     process.exit(0);
 }
 
-module.exports = { readEnv, runWorker, startForwarder, log };
+module.exports = { readEnv, runWorker, startForwarder, proxySelfCheck, log };
 
 if (require.main === module) main();

@@ -324,6 +324,46 @@ function saveState(file, { email, pushMtimeMs, cookies }) {
     fs.renameSync(tmp, file);
 }
 
+// ------------------------------------------------------------------- 出口代理 ----
+// Playwright 在 Chromium 上默认「强制代理环回地址」（往 bypass 里塞 <-loopback>），除非
+// bypass 里显式列出某个环回主机。页面连的是 ws://127.0.0.1:<port>（worker 的环回转发），
+// 若走代理会被转到代理机自己的 127.0.0.1 而失败，所以这里总是显式加上环回直连。
+const LOOPBACK_BYPASS = ["127.0.0.1", "localhost", "[::1]"];
+const PROXY_SCHEMES = { http: "http", https: "https", socks: "socks5", socks5: "socks5", socks5h: "socks5", socks4: "socks4" };
+
+// proxyConfig 把 PGGO_PROXY / PGGO_PROXY_BYPASS 解析为 Playwright 的 proxy 选项；未设置返回 null。
+// 凭据（http://user:pass@host:port）拆到 username/password，server 里不含凭据。
+function proxyConfig(raw, bypassRaw) {
+    raw = String(raw || "").trim();
+    if (!raw) return null;
+    let u;
+    try {
+        u = new URL(/^[a-z][a-z0-9+.-]*:\/\//i.test(raw) ? raw : `http://${raw}`);
+    } catch (_) {
+        throw new Error("PGGO_PROXY 不是合法的代理地址（例：http://singbox:2080 或 socks5://singbox:2080）");
+    }
+    const scheme = PROXY_SCHEMES[u.protocol.replace(/:$/, "").toLowerCase()];
+    if (!scheme) throw new Error(`PGGO_PROXY 协议不支持: ${u.protocol}（支持 http / https / socks5 / socks4）`);
+    if (!u.hostname) throw new Error("PGGO_PROXY 缺少主机名");
+    const out = { server: `${scheme}://${u.host}` };
+    if (u.username || u.password) {
+        if (scheme !== "http" && scheme !== "https") {
+            throw new Error("Chromium 不支持带认证的 SOCKS 代理：请改用 http://user:pass@host:port，或去掉代理入站的认证");
+        }
+        out.username = decodeURIComponent(u.username);
+        out.password = decodeURIComponent(u.password);
+    }
+    const extra = String(bypassRaw || "").split(/[,;\s]+/).map((s) => s.trim()).filter(Boolean);
+    out.bypass = [...new Set([...LOOPBACK_BYPASS, ...extra])].join(",");
+    return out;
+}
+
+// describeProxy 用于日志：只含协议/主机/端口，不含凭据。
+function describeProxy(proxy) {
+    if (!proxy) return "直连（未设置 PGGO_PROXY）";
+    return `${proxy.server}${proxy.username ? "（带认证）" : ""}`;
+}
+
 module.exports = {
     REQUIRED_COOKIES,
     sanitizeLabel,
@@ -342,4 +382,7 @@ module.exports = {
     normalizeWsUrl,
     isLoopbackHost,
     buildInitScript,
+    proxyConfig,
+    describeProxy,
+    LOOPBACK_BYPASS,
 };
