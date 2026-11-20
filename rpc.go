@@ -268,8 +268,18 @@ type metadata struct {
 	ConfigFields     []configField `json:"ConfigFields"`
 }
 
+// capabilities 对应 CPA pluginhost.rpcCapabilities 的 json tag。
+//
+// 为什么要 model_router：CPA 的常规路径（模型 → provider → 认证调度器）要求 provider
+// 下至少有一个 Auth 记录；本插件没有凭据（执行器连的是浏览器），executor 的静态模型
+// 只会进 /v1/models 列表，请求会在选认证时直接 auth_not_found。CPA 为「无需认证的
+// 插件执行器」提供的入口是 ModelRouter：model.route 返回 Handled + TargetKind=self 后，
+// 宿主跳过 provider/认证选择，直接调用本插件的 executor.execute(_stream)
+// （CPA sdk/api/handlers/handlers_execution.go executeWithAuthManagerFormats →
+// executeWithPluginExecutor；internal/pluginhost/model_router.go RouteModelExcept）。
 type capabilities struct {
 	ModelRegistrar        bool     `json:"model_registrar"`
+	ModelRouter           bool     `json:"model_router"`
 	Executor              bool     `json:"executor"`
 	ExecutorModelScope    string   `json:"executor_model_scope"`
 	ExecutorInputFormats  []string `json:"executor_input_formats"`
@@ -303,8 +313,10 @@ func registrationPayload() registration {
 		},
 		Capabilities: capabilities{
 			ModelRegistrar:        true,
+			ModelRouter:           true,
 			Executor:              true,
-			ExecutorModelScope:    "both",
+			// static：执行器只服务无认证的静态模型（宿主 executorPluginReady 要求允许静态模型）
+			ExecutorModelScope:    "static",
 			ExecutorInputFormats:  []string{"chat-completions"},
 			ExecutorOutputFormats: []string{"chat-completions"},
 		},
@@ -385,7 +397,45 @@ type executorStreamResponse struct {
 	Chunks  []streamChunk `json:"chunks,omitempty"`
 }
 
+// model.route 的请求/响应。CPA 侧是无 json tag 的 pluginapi.ModelRouteRequest/
+// ModelRouteResponse（内嵌进 rpcModelRouteRequest），因此字段名为大驼峰。
+type modelRouteRequest struct {
+	SourceFormat   string `json:"SourceFormat"`
+	RequestedModel string `json:"RequestedModel"`
+}
+
+type modelRouteResponse struct {
+	Handled    bool   `json:"Handled"`
+	TargetKind string `json:"TargetKind,omitempty"`
+	Reason     string `json:"Reason,omitempty"`
+}
+
+// ownsModel 判断请求的模型是否属于本插件：命中任一已启用通道的前缀（前缀后须有模型名）。
+// 与 routeModel 不同，这里不做「无前缀回落到 page 通道」——那会把别的 provider 的模型抢走。
+func ownsModel(c pluginConfig, model string) bool {
+	model = strings.TrimSpace(model)
+	for _, prefix := range []string{c.ModelPrefix, c.HeadlessModelPrefix} {
+		if prefix != "" && len(model) > len(prefix) && strings.HasPrefix(model, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// routeModelRPC 对本插件的模型声明「由自己的执行器处理」，其余一律不处理（交还宿主）。
+// 宿主对每个请求都会调用路由器，这里只做前缀判断，不记日志。
+func routeModelRPC(request []byte) []byte {
+	var req modelRouteRequest
+	if err := json.Unmarshal(request, &req); err != nil || !ownsModel(currentConfig(), req.RequestedModel) {
+		return okEnvelope(modelRouteResponse{Handled: false})
+	}
+	return okEnvelope(modelRouteResponse{Handled: true, TargetKind: "self", Reason: "pggo_model_prefix"})
+}
+
 func handleRPC(method string, request []byte) (out []byte, rc int) {
+	if method == "model.route" {
+		return routeModelRPC(request), 0
+	}
 	logf("rpc %s (%d bytes)", method, len(request))
 	switch method {
 	case "plugin.register", "plugin.reconfigure":
