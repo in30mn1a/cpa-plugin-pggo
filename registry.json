@@ -6,7 +6,7 @@
       "name": "PGGO Playground Executor",
       "description": "Use a browser AI Studio page (driven by the Catiecli Playground Executor userscript) as a CLIProxyAPI executor, with an embedded WebSocket hub and an optional cloud headless worker.",
       "author": "in30mn1a",
-      "version": "1.1.0",
+      "version": "1.1.1",
       "repository": "https://github.com/in30mn1a/cpa-plugin-pggo",
       "homepage": "https://github.com/in30mn1a/cpa-plugin-pggo",
       "tags": ["Provider"],

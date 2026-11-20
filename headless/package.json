@@ -1,6 +1,6 @@
 {
   "name": "pggo-headless",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "private": true,
   "description": "Cloud headless executor for the pggo CLIProxyAPI plugin (Playwright + Chromium running the Catiecli Playground Executor userscript)",
   "main": "src/worker.js",
