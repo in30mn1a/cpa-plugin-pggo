@@ -52,10 +52,11 @@ v1.1.0 只声明了 `model_registrar` + `executor`：`/v1/models` 能列出 `pg/
   （`internal/pluginhost/executor_route.go` 86–113；就绪检查 `executorPluginReady` 要求执行器允许静态模型且格式兼容）。官方示例
   `examples/plugin/claude-web-search-router` 也是 `model_router` + `executor`（`executor_model_scope: static`）。
 
-所以 v1.1.1 增加 `model_router`、执行器作用域改为 `static`。**CPA 侧不需要任何额外配置**（不需要凭证条目）。
-限制：CPA 开启 Home（集群）模式时插件执行器路由不可用（`executeWithPluginExecutor` 直接 503）；Claude 原生入口（`/v1/messages`）因执行器只接受
-chat-completions，路由就绪检查不通过，会回落到常规路径并报 `auth_not_found`——请用 OpenAI 兼容入口。以上为源码核对 + 单元测试（注册载荷形态、`model.route` 编解码），
-尚未在运行中的 CPA 上实测。
+所以 v1.1.1 增加 `model_router`（这是关键修复）。执行器作用域同时改为 `static`：这一项并非必需——未声明 auth provider 时 `both`
+本来就允许静态模型（`executorScopeAllowsStaticModels`），改成 `static` 只是语义更明确，无副作用。**CPA 侧不需要任何额外配置**（不需要凭证条目）。
+限制：CPA 开启 Home（集群）模式时插件执行器路由不可用（`executeWithPluginExecutor` 直接 503）。Claude 原生入口（`/v1/messages`）**未测试**：
+执行器只声明 chat-completions，CPA 带有 Claude→OpenAI 转换器，可能可用，也可能在路由就绪检查处回落；推荐用 OpenAI 兼容入口。
+以上为源码核对 + 单元测试（注册载荷形态、`model.route` 编解码），尚未在运行中的 CPA 上实测。
 
 wire 编解码按 [AI Studio 私有协议](https://github.com/Mag1cFall/AIStudio2API/blob/main/docs/protocol.md) 的字段表实现：
 根数组 `[0]=models/<id>`、`[1]=contents`、`[3]=generationConfig`、`[4]` 留给脚本注入 WAA proof、`[5]=systemInstruction`、`[10]=1`、`[13]=时区`；
@@ -112,7 +113,8 @@ plugins:
 每个版本有自己的 Go 运行时，所以旧实例必须主动交出端口。v1.1.1 起：
 
 - 收到 `plugin.quiesce`（或 `plugin.shutdown` / C ABI shutdown）时同步关闭监听、以 `1001` 断开所有 WS（脚本自动重连到新实例）、进行中的请求立即以 `503 hub_restarting` 失败；
-  之后只有 `plugin.register` / `plugin.reconfigure`（CPA 在新版本加载失败回滚时会对旧实例再调 `plugin.register`）会重新拉起中枢，其它调用不会。
+  之后只有 `plugin.register` / `plugin.reconfigure` 会重新拉起中枢，其它调用不会（新版本加载失败回滚时，CPA 对已注册过的旧实例发的是 `plugin.reconfigure`）。
+- 关闭流程不会等待卡住的写操作：WS 写有超时（普通帧 30s、关闭帧 1s），写锁被占用时直接断开底层连接，所以半开的执行器连接拖不住 `plugin.quiesce`。
 - 新实例绑定时若端口仍被占用，会在后台重试（前 60s 每秒一次，之后每 15s 一次，日志每分钟至多一条），旧实例释放后自动接管；静默/关闭/改 `listen` 会取消重试。
 - `GET /api/pg/status` 带 `version` 字段，可确认当前接管端口的是哪个版本。
 
@@ -225,7 +227,7 @@ location /api/robin/ { proxy_pass http://127.0.0.1:8788; proxy_read_timeout 1800
 | 变量 | 默认 | 说明 |
 |---|---|---|
 | `PGGO_API_KEY` | （必填） | 执行器 Key，必须在插件 `api-keys` 之列 |
-| `PGGO_WS_URL` | `ws://cliproxy:8788/api/pg/ws?channel=headless` | 中枢 WS 地址；缺 `channel` 参数会自动补 `channel=headless`；非环回的 `ws://` 自动走本机透传，`wss://` 直连 |
+| `PGGO_WS_URL` | `ws://cliproxy:8788/api/pg/ws?channel=headless` | 中枢 WS 地址；缺 `channel` 参数会自动补 `channel=headless`；非环回的 `ws://` 自动走本机透传（Node 侧 TCP，不经浏览器代理）；`wss://` 由页面直连，设置了 `PGGO_PROXY` 时**会经过浏览器代理**（需要时把中枢主机加进 `PGGO_PROXY_BYPASS`） |
 | `PGGO_COOKIE_DIR` | `/data/cookies` | Cookie 推送目录（挂载 `data_dir/cookies`，只读即可） |
 | `PGGO_COOKIE_FILE` | 空 | 指定文件名（相对 `PGGO_COOKIE_DIR`）或绝对路径 |
 | `PGGO_COOKIE_LABEL` | 空（**强烈建议设置**） | 按邮箱选文件（匹配文件名或文件内 `email`）；`FILE` 与 `LABEL` 都不填时用目录里**最新**的 `*.json`，目录里有多个账号时日志会告警并写明选中的账号（只写邮箱/文件名） |
@@ -253,6 +255,7 @@ location /api/robin/ { proxy_pass http://127.0.0.1:8788; proxy_read_timeout 1800
   `--host-resolver-rules="MAP * ~NOTFOUND , EXCLUDE <代理主机>"`，连直连的 `127.0.0.1` 也会解析失败。
 - Playwright 默认**强制环回地址也走代理**（bypass 里不含环回主机时追加 `<-loopback>`），而页面连的正是 `ws://127.0.0.1:<端口>`（worker 的环回转发）。
   所以 bypass 里总是显式带上 `127.0.0.1,localhost,[::1]`。中枢 WS 本身由 worker 的 Node 侧 TCP 转发到 `cliproxy:8788`，不经过浏览器代理。
+- 环回转发只用于明文 `ws://` 的中枢地址。若 `PGGO_WS_URL` 用 `wss://`，页面会直接连中枢，这条连接**会走 `PGGO_PROXY`**；内部中枢请把它的主机名加进 `PGGO_PROXY_BYPASS`。
 - 已用本地 CONNECT 代理跑 `TestHeadlessWorkerIntegration` 验证：代理只看到 `ipinfo.io`、`aistudio.google.com` 等外部目标，没有任何到中枢端口的连接，headless 通道正常注册并收发请求。
 
 **`xvfb` 还是 `new`？** 默认 `xvfb`。这条链路成败取决于页面里的 BotGuard/WAA proof，有头浏览器是与真实用户差异最小的形态；
@@ -386,7 +389,7 @@ curl -X POST https://your.domain.example/api/pg/exec \
 | 现象 | 定位 |
 |---|---|
 | `/v1/models` 没有 `pg-*` | 插件没加载：看 CPA 启动日志有没有 `plugin` 报错；文件名必须叫 `pggo-v<版本>.so` |
-| 模型列表有、请求 503 `auth_not_found` | 插件 ≤ 1.1.0（没有 `model_router`）→ 升级到 1.1.1；或 CPA 开了 Home 模式 / 走的是 Claude 原生入口（见「为什么需要 model_router」） |
+| 模型列表有、请求 503 `auth_not_found` | 插件 ≤ 1.1.0（没有 `model_router`）→ 升级到 1.1.1；或 CPA 开了 Home 模式；Claude 原生入口未测试，可先换 OpenAI 兼容入口排除（见「为什么需要 model_router」） |
 | 热更新后 `bind: address already in use` / 「仍无法绑定」 | 旧实例是 ≤ 1.1.0，不会释放端口：重启一次 CPA；`/api/pg/status` 的 `version` 可确认接管者 |
 | 模型列表有、请求 503 `executor_offline` | 报错里点名的通道没有执行器：看 `/api/pg/status` 的 `channels`；page 查 `listen` 端口和反代，headless 查 worker 容器日志 |
 | 请求 502 `upstream_not_json` | 页面拿到了非 200（proof/headers 没就绪），面板日志里有具体上游错误 |

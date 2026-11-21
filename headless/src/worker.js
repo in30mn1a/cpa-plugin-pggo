@@ -75,6 +75,8 @@ async function proxySelfCheck(proxy, request) {
 // https 页面里连明文 ws://cliproxy:8788 会被当作混合内容拦截；环回地址
 // （127.0.0.1）属于「潜在可信」源不受此限。所以对非环回的 ws:// 目标，在
 // worker 进程里开一个 127.0.0.1 随机端口做 TCP 透传，页面只连本机。
+// 只对明文 ws:// 生效：wss:// 由页面直连中枢，设置了 PGGO_PROXY 时会经过浏览器代理
+// （内部中枢需加入 PGGO_PROXY_BYPASS）。
 async function startForwarder(target) {
     const u = new URL(target);
     if (u.protocol !== "ws:" || lib.isLoopbackHost(u.hostname)) {
