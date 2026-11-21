@@ -111,9 +111,10 @@ type bindRetry struct {
 	fast, fastWindow, slow, logEvery time.Duration
 }
 
-// ensureHub 按配置启动/更新中枢。只由 plugin.register / plugin.reconfigure 调用——后者
-// 也是 CPA 重新激活已静默实例的方式（热更新失败回滚时 callRegister 对已注册过的旧实例发
-// plugin.reconfigure），所以静默（plugin.quiesce）后只有它们会重新拉起中枢，其它 RPC 不会。
+// ensureHub 按配置启动/更新中枢。调用方是 lifecycle.go 的生命周期迁移（持 lifecycleMu）：
+// plugin.register / plugin.reconfigure（后者也是 CPA 热更新失败回滚时重新激活已静默旧实例的
+// 方式）、再次 cliproxy_plugin_init、以及停用后的第一条业务 RPC。静默（plugin.quiesce）后业务
+// RPC 不会拉起中枢。
 func ensureHub(c pluginConfig) {
 	hubMu.Lock()
 	defer hubMu.Unlock()
@@ -235,7 +236,8 @@ func activeHub() *hub {
 	return theHub
 }
 
-// shutdownHub 用于 C ABI shutdown 与 plugin.shutdown。
+// shutdownHub 只停中枢、不改生命周期意图（测试清理用）；C ABI shutdown 与 plugin.shutdown
+// 走 lifecycle.go 的 pluginShutdown。
 func shutdownHub() { stopHub("plugin shutdown") }
 
 // stopHub 释放监听端口、以 1001 断开全部 WS（脚本会自动重连到接管端口的新实例）、

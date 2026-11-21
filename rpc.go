@@ -151,7 +151,7 @@ func applyConfig(request []byte) {
 	cfgMu.Lock()
 	cfg = next
 	cfgMu.Unlock()
-	ensureHub(currentConfig())
+	activateHub(currentConfig())
 }
 
 func loadConfigFile(path string) (pluginConfig, error) {
@@ -514,9 +514,13 @@ func recoverRPC(method string, fn func() ([]byte, int)) (out []byte, rc int) {
 
 func handleRPC(method string, request []byte) (out []byte, rc int) {
 	if method == "model.route" {
+		reviveIfShutdown() // 停用后若宿主不再注册，这是唯一的信号（每个 CPA 请求都会路由）
 		return routeModelRPC(request), 0
 	}
 	logf("rpc %s (%d bytes)", method, len(request))
+	if !strings.HasPrefix(method, "plugin.") {
+		reviveIfShutdown()
+	}
 	switch method {
 	case "plugin.register", "plugin.reconfigure":
 		applyConfig(request)
@@ -526,11 +530,11 @@ func handleRPC(method string, request []byte) (out []byte, rc int) {
 		// 成功后才加载新实例并对其 plugin.register。c-shared 库不会被卸载，旧实例必须在此
 		// 同步交出端口，否则新实例绑定失败。若新实例加载失败，CPA 回滚时会对旧实例发
 		// plugin.reconfigure（callRegister 对已注册实例用 reconfigure），届时 ensureHub 重新拉起中枢。
-		stopHub("plugin quiescing")
+		quiesceHub()
 		logf("已静默：中枢端口已释放，WS 已以 1001 断开")
 		return okEnvelope(struct{}{}), 0
 	case "plugin.shutdown":
-		shutdownHub()
+		pluginShutdown()
 		return okEnvelope(struct{}{}), 0
 	case "executor.identifier":
 		return okEnvelope(map[string]string{"identifier": "pggo"}), 0
