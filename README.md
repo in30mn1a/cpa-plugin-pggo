@@ -69,15 +69,15 @@ wire 编解码按 [AI Studio 私有协议](https://github.com/Mag1cFall/AIStudio
 ```bash
 # Linux（CPA 主机上，需 gcc + Go 1.22+）
 cd cpa-plugin-pggo
-make build            # 产出 bin/pggo-v1.1.1.so
+make build            # 产出 bin/pggo-v1.1.2.so
 # 或直接
-CGO_ENABLED=1 go build -trimpath -buildmode=c-shared -ldflags "-s -w" -o pggo-v1.1.1.so .
+CGO_ENABLED=1 go build -trimpath -buildmode=c-shared -ldflags "-s -w" -o pggo-v1.1.2.so .
 ```
 
 Windows（装了 MinGW-w64 的机器）：
 
 ```powershell
-$env:CGO_ENABLED=1; go build -trimpath -buildmode=c-shared -ldflags "-s -w" -o pggo-v1.1.1.dll .
+$env:CGO_ENABLED=1; go build -trimpath -buildmode=c-shared -ldflags "-s -w" -o pggo-v1.1.2.dll .
 ```
 
 **没有 gcc？用 Docker 出 Linux 版**（`Dockerfile.build`，已锁 `GOAMD64=v1`）：
@@ -91,7 +91,7 @@ docker build -f Dockerfile.build --output type=local,dest=bin/linux-amd64 .
 **不支持 Alpine/musl 环境**：Go c-shared 库在 musl 上无法被 dlopen（实测段错误 / TLS 重定位错误）。
 可在 CPA 容器里 `ldd --version 2>&1 | head -1` 确认，输出含 `GLIBC` 即可用。
 
-> 插件目录下的文件名决定 ID 与版本：`pggo-v1.1.1.so` → ID `pggo`、版本 `1.1.1`。
+> 插件目录下的文件名决定 ID 与版本：`pggo-v1.1.2.so` → ID `pggo`、版本 `1.1.2`。
 > CI 交叉编译时记得锁指令集基线：`GOAMD64=v1 CGO_CFLAGS="-march=x86-64"`，否则老 CPU 上会 SIGILL。
 
 ## 安装
@@ -113,10 +113,21 @@ plugins:
 每个版本有自己的 Go 运行时，所以旧实例必须主动交出端口。v1.1.1 起：
 
 - 收到 `plugin.quiesce`（或 `plugin.shutdown` / C ABI shutdown）时同步关闭监听、以 `1001` 断开所有 WS（脚本自动重连到新实例）、进行中的请求立即以 `503 hub_restarting` 失败；
-  之后只有 `plugin.register` / `plugin.reconfigure` 会重新拉起中枢，其它调用不会（新版本加载失败回滚时，CPA 对已注册过的旧实例发的是 `plugin.reconfigure`）。
+  静默（`plugin.quiesce`）后只有 `plugin.register` / `plugin.reconfigure` 会重新拉起中枢，其它调用不会（新版本加载失败回滚时，CPA 对已注册过的旧实例发的是 `plugin.reconfigure`）。
 - 关闭流程不会等待卡住的写操作：WS 写有超时（普通帧 30s、关闭帧 1s），写锁被占用时直接断开底层连接，所以半开的执行器连接拖不住 `plugin.quiesce`。
 - 新实例绑定时若端口仍被占用，会在后台重试（前 60s 每秒一次，之后每 15s 一次，日志每分钟至多一条），旧实例释放后自动接管；静默/关闭/改 `listen` 会取消重试。
 - `GET /api/pg/status` 带 `version` 字段，可确认当前接管端口的是哪个版本。
+
+**停用后再启用（v1.1.2 修复）**：在面板关掉插件（或配置 `enabled: false`）时，CPA 只调 C 层 shutdown
+（`internal/pluginhost/host.go` `detachPlugin` → `loader_unix.go` `close`），库仍驻留在进程里；再启用时 CPA 对同一份影子副本重新
+`dlopen`（同一句柄、同一 Go 运行时）并再调一次 `cliproxy_plugin_init`。≤ 1.1.1 只在 `plugin.register` 时启动中枢，而线上观察到再启用后
+一条 RPC 都没收到，于是端口一直关着、只能重启 CPA。v1.1.2 起区分「停用」与「静默」：
+
+- 被 shutdown 停掉的实例，在**再次 `cliproxy_plugin_init`** 或**停用后的第一个业务调用**（`model.route` 每个 CPA 请求都会调，
+  另有 `model.register` / `executor.*`）时，按最后一次下发的配置自动重新拉起中枢，日志会有「重新拉起中枢」一行；热路径只多一次原子读。
+- 被 `plugin.quiesce` 静默的实例（正被新版本替换）绝不会因为迟到的调用抢回端口；热更新后再停用、CPA 对旧实例补发的 shutdown 也不会让它变成可复活。
+- 若再启用后宿主什么都不调，中枢会在**下一个经过 CPA 的请求**时回来；页面脚本与 headless worker 随后自动重连（无需手动操作），
+  所以再启用后的头一两个 `pg-*` / `pggo-*` 请求可能还是 `executor_offline`，稍等即可。
 
 > ⚠ **从 ≤ 1.1.0 升级需要重启一次 CPA**：旧实例不认识 `plugin.quiesce`（CPA 视为「不支持」并继续加载新实例），端口不会被释放；
 > 新实例会一直后台重试并每分钟打一条「仍无法绑定」日志，直到 CPA 重启。从 1.1.1 往后的升级不再需要重启。
@@ -126,7 +137,7 @@ plugins:
 ```bash
 # CPA 的 plugins 目录（config.yaml 里的 plugins.dir，默认 ./plugins）
 mkdir -p plugins/linux/amd64
-cp bin/linux-amd64/pggo.so plugins/linux/amd64/pggo-v1.1.1.so
+cp bin/linux-amd64/pggo.so plugins/linux/amd64/pggo-v1.1.2.so
 ```
 
 ## 配置
@@ -362,7 +373,7 @@ curl https://your.domain.example/v1/chat/completions \
 
 ```bash
 curl https://your.domain.example/api/pg/status
-# {"version":"1.1.1","online":true,"connected_at":1795178734,"pending":0,"models":[...],
+# {"version":"1.1.2","online":true,"connected_at":1795178734,"pending":0,"models":[...],
 #  "channels":{"page":{"online":true,"connected_at":1795178734},"headless":{"online":false}}}
 
 curl -X POST https://your.domain.example/api/pg/exec \
@@ -390,6 +401,7 @@ curl -X POST https://your.domain.example/api/pg/exec \
 |---|---|
 | `/v1/models` 没有 `pg-*` | 插件没加载：看 CPA 启动日志有没有 `plugin` 报错；文件名必须叫 `pggo-v<版本>.so` |
 | 模型列表有、请求 503 `auth_not_found` | 插件 ≤ 1.1.0（没有 `model_router`）→ 升级到 1.1.1；或 CPA 开了 Home 模式；Claude 原生入口未测试，可先换 OpenAI 兼容入口排除（见「为什么需要 model_router」） |
+| 停用再启用插件后 `listen` 端口一直关着 | 插件 ≤ 1.1.1：重启 CPA 或升级到 1.1.2（之后随下一个请求自动恢复，见「停用后再启用」） |
 | 热更新后 `bind: address already in use` / 「仍无法绑定」 | 旧实例是 ≤ 1.1.0，不会释放端口：重启一次 CPA；`/api/pg/status` 的 `version` 可确认接管者 |
 | 模型列表有、请求 503 `executor_offline` | 报错里点名的通道没有执行器：看 `/api/pg/status` 的 `channels`；page 查 `listen` 端口和反代，headless 查 worker 容器日志 |
 | 请求 502 `upstream_not_json` | 页面拿到了非 200（proof/headers 没就绪），面板日志里有具体上游错误 |
@@ -404,6 +416,7 @@ CGO_ENABLED=0 go test -count=1 ./...
 
 Go 侧用例覆盖：wire 形状（含 proof 槽位、时区路径、generationConfig 下标）、真实帧解码（正文/思考/usage/流尾错误）、
 SSE 收尾、YAML 配置抽取、WS 注册鉴权（4008）、顶替（4001）、分块补发拼接、`/api/pg/exec` 全链路、推送与绑定存档。
+v1.1.2 新增：shutdown 后再次 init / 首个业务调用重新拉起中枢、静默实例不被调用复活（含静默后再 shutdown）、未注册过的实例不凭默认配置启动、并发复活只建一个中枢（`go test -race`）。
 v1.1.1 新增：注册载荷形态（`model_router` + `static` 执行器、无 `auth_provider`）、`model.route` 按 CPA 真实编码路由、`plugin.quiesce` 释放端口后第二个中枢可绑定同端口且 WS 收到 1001、
 端口占用时后台重试并在释放后接管、静默/关闭/改地址取消重试；worker 侧代理配置解析（含环回直连与 bypass 合并）与出口自检。
 v1.1.0 新增：双通道同 Key 共存与通道内顶替、按前缀路由（含 `pg/` 与 `pggo/`、互为前缀的最长匹配）、离线通道 503、status JSON（未连接不输出零值时间）、前缀面板字段解析与双套注册。
