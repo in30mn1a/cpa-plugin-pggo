@@ -111,9 +111,9 @@ type bindRetry struct {
 	fast, fastWindow, slow, logEvery time.Duration
 }
 
-// ensureHub 按配置启动/更新中枢。只由 plugin.register / plugin.reconfigure 调用——这两者
-// 也是 CPA 重新激活已静默实例的方式（热更新失败回滚时会对旧实例再调 plugin.register），
-// 所以静默（plugin.quiesce）后只有它们会重新拉起中枢，其它 RPC 不会。
+// ensureHub 按配置启动/更新中枢。只由 plugin.register / plugin.reconfigure 调用——后者
+// 也是 CPA 重新激活已静默实例的方式（热更新失败回滚时 callRegister 对已注册过的旧实例发
+// plugin.reconfigure），所以静默（plugin.quiesce）后只有它们会重新拉起中枢，其它 RPC 不会。
 func ensureHub(c pluginConfig) {
 	hubMu.Lock()
 	defer hubMu.Unlock()
@@ -325,8 +325,7 @@ func (h *hub) closeWith(reason string) {
 		h.finish(nil, rid, rpcErrf(http.StatusServiceUnavailable, "hub_restarting", "执行器中枢重启/停止，请重试"))
 	}
 	for _, conn := range conns {
-		_ = conn.writeClose(1001, reason)
-		conn.shutdown()
+		conn.closeNow(1001, reason)
 	}
 }
 
@@ -746,8 +745,7 @@ func (h *hub) serveWS(w http.ResponseWriter, r *http.Request) {
 			h.connAt[channel] = time.Now()
 			h.mu.Unlock()
 			if prev != nil && prev != conn {
-				_ = prev.writeClose(4001, "replaced by new connection")
-				prev.shutdown()
+				prev.closeNow(4001, "replaced by new connection")
 			}
 			authed = true
 			_ = conn.writeText(mustJSON(map[string]any{"type": "registered", "executorType": "playground"}))
@@ -921,21 +919,48 @@ func (w *wsConn) readMessage() (byte, []byte, error) {
 	}
 }
 
+// 写超时：半开的执行器连接（对端不读、TCP 窗口满）不能无限期卡住 dispatch 或关闭流程。
+var (
+	wsWriteTimeout = 30 * time.Second
+	wsCloseTimeout = time.Second
+)
+
 func (w *wsConn) writeText(payload []byte) error { return w.writeFrame(0x1, payload) }
 
-func (w *wsConn) writeClose(code uint16, reason string) error {
+func closePayload(code uint16, reason string) []byte {
 	payload := make([]byte, 2, 2+len(reason))
 	binary.BigEndian.PutUint16(payload, code)
-	payload = append(payload, []byte(reason)...)
-	return w.writeFrame(0x8, payload)
+	return append(payload, []byte(reason)...)
+}
+
+func (w *wsConn) writeClose(code uint16, reason string) error {
+	w.wmu.Lock()
+	defer w.wmu.Unlock()
+	return w.writeFrameLocked(0x8, closePayload(code, reason), wsCloseTimeout)
+}
+
+// closeNow 尽力发送关闭帧后立即断开底层连接，绝不等待卡住的写者：写锁被占用（另一个
+// 写操作卡在半开连接上）时直接关闭 net.Conn，这同时会让那个写操作立刻返回错误。
+// 用于 plugin.quiesce / shutdown，这些是同步 C 调用，阻塞会拖住 CPA 的热更新。
+func (w *wsConn) closeNow(code uint16, reason string) {
+	if w.wmu.TryLock() {
+		_ = w.writeFrameLocked(0x8, closePayload(code, reason), wsCloseTimeout)
+		w.wmu.Unlock()
+	}
+	w.shutdown()
 }
 
 func (w *wsConn) writeFrame(opcode byte, payload []byte) error {
 	w.wmu.Lock()
 	defer w.wmu.Unlock()
+	return w.writeFrameLocked(opcode, payload, wsWriteTimeout)
+}
+
+func (w *wsConn) writeFrameLocked(opcode byte, payload []byte, timeout time.Duration) error {
 	if w.closed.Load() {
 		return io.ErrClosedPipe
 	}
+	_ = w.c.SetWriteDeadline(time.Now().Add(timeout))
 	header := make([]byte, 0, 10)
 	header = append(header, 0x80|opcode)
 	n := len(payload)
