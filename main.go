@@ -74,7 +74,7 @@ func cliproxyPluginCall(method *C.char, request *C.uint8_t, requestLen C.size_t,
 	if request != nil && requestLen > 0 {
 		req = C.GoBytes(unsafe.Pointer(request), C.int(requestLen))
 	}
-	out, rc := handleRPC(C.GoString(method), req)
+	out, rc := safeHandleRPC(C.GoString(method), req) // 内含 recover，panic 不会带走 CPA
 	writeCResponse(response, out)
 	return C.int(rc)
 }

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -311,7 +312,8 @@ func registrationPayload() registration {
 				{Name: "config_file", Type: "string", Description: "可选：JSON 配置文件路径（高级项 model_map/timezone 等）；面板字段非空时优先"},
 			},
 		},
-		// executor_model_scope=static：执行器只服务无认证的静态模型（宿主 executorPluginReady 要求允许静态模型）
+		// executor_model_scope=static：执行器只服务无认证的静态模型。并非必需——未声明 auth provider 时
+		// both 同样允许静态模型（宿主 executorScopeAllowsStaticModels），static 只是更明确、无副作用
 		Capabilities: capabilities{
 			ModelRegistrar:        true,
 			ModelRouter:           true,
@@ -399,8 +401,9 @@ type executorStreamResponse struct {
 
 // model.route 的请求/响应。CPA 侧是无 json tag 的 pluginapi.ModelRouteRequest/
 // ModelRouteResponse（内嵌进 rpcModelRouteRequest），因此字段名为大驼峰。
+// 只声明需要的字段：请求里还带着整份 base64 请求体（Body），encoding/json 对未声明的
+// 字段只做扫描、不解码不分配。
 type modelRouteRequest struct {
-	SourceFormat   string `json:"SourceFormat"`
 	RequestedModel string `json:"RequestedModel"`
 }
 
@@ -413,8 +416,12 @@ type modelRouteResponse struct {
 // ownsModel 判断请求的模型是否属于本插件：命中任一已启用通道的前缀（前缀后须有模型名）。
 // 与 routeModel 不同，这里不做「无前缀回落到 page 通道」——那会把别的 provider 的模型抢走。
 func ownsModel(c pluginConfig, model string) bool {
+	return ownsModelPrefixes(c.ModelPrefix, c.HeadlessModelPrefix, model)
+}
+
+func ownsModelPrefixes(pagePrefix, headlessPrefix, model string) bool {
 	model = strings.TrimSpace(model)
-	for _, prefix := range []string{c.ModelPrefix, c.HeadlessModelPrefix} {
+	for _, prefix := range [2]string{pagePrefix, headlessPrefix} {
 		if prefix != "" && len(model) > len(prefix) && strings.HasPrefix(model, prefix) {
 			return true
 		}
@@ -422,14 +429,87 @@ func ownsModel(c pluginConfig, model string) bool {
 	return false
 }
 
+// 路由结果固定，预先编码；调用方（C ABI 出口会拷贝）不得修改。
+var (
+	routeNotHandled = okEnvelope(modelRouteResponse{Handled: false})
+	routeSelf       = okEnvelope(modelRouteResponse{Handled: true, TargetKind: "self", Reason: "pggo_model_prefix"})
+)
+
 // routeModelRPC 对本插件的模型声明「由自己的执行器处理」，其余一律不处理（交还宿主）。
-// 宿主对每个请求都会调用路由器，这里只做前缀判断，不记日志。
+// 宿主对所有 provider 的每个请求都会调用路由器：只解码模型名、只读两个前缀，不记日志。
 func routeModelRPC(request []byte) []byte {
-	var req modelRouteRequest
-	if err := json.Unmarshal(request, &req); err != nil || !ownsModel(currentConfig(), req.RequestedModel) {
-		return okEnvelope(modelRouteResponse{Handled: false})
+	model, ok := fastRequestedModel(request)
+	if !ok {
+		var req modelRouteRequest
+		if err := json.Unmarshal(request, &req); err != nil {
+			return routeNotHandled
+		}
+		model = req.RequestedModel
 	}
-	return okEnvelope(modelRouteResponse{Handled: true, TargetKind: "self", Reason: "pggo_model_prefix"})
+	cfgMu.RLock()
+	owned := ownsModelPrefixes(cfg.ModelPrefix, cfg.HeadlessModelPrefix, model)
+	cfgMu.RUnlock()
+	if !owned {
+		return routeNotHandled
+	}
+	return routeSelf
+}
+
+var requestedModelKey = []byte(`"RequestedModel":`)
+
+// fastRequestedModel 直接定位 "RequestedModel" 的值，避免为取一个字段而扫描整份
+// （含 base64 请求体的）JSON。能这样做是因为：该键名带紧随的引号与冒号，不可能出现在
+// JSON 字符串值内部（字符串里的引号必须转义）；Body 是 base64 不含引号；请求里其它对象的
+// 键（插件元数据字段名、snake_case 的 Metadata 键）不会叫这个名字。任何意外都返回 ok=false，
+// 由调用方回落到完整的 json.Unmarshal。
+func fastRequestedModel(request []byte) (string, bool) {
+	i := bytes.Index(request, requestedModelKey)
+	if i < 0 {
+		return "", false
+	}
+	rest := bytes.TrimLeft(request[i+len(requestedModelKey):], " \t\r\n")
+	if len(rest) == 0 || rest[0] != '"' {
+		return "", false
+	}
+	end := -1
+	for j := 1; j < len(rest); j++ {
+		if rest[j] == '\\' {
+			j++
+			continue
+		}
+		if rest[j] == '"' {
+			end = j
+			break
+		}
+	}
+	if end < 0 {
+		return "", false
+	}
+	token := rest[:end+1]
+	if bytes.IndexByte(token, '\\') < 0 {
+		return string(token[1:end]), true
+	}
+	var model string
+	if err := json.Unmarshal(token, &model); err != nil {
+		return "", false
+	}
+	return model, true
+}
+
+// safeHandleRPC 是 C ABI 入口用的 handleRPC：本库跑在 CPA 进程内，任何 panic 都会带走
+// 宿主（model.route 对所有请求都会调用），这里兜底成 500 错误信封并记录。
+func safeHandleRPC(method string, request []byte) (out []byte, rc int) {
+	return recoverRPC(method, func() ([]byte, int) { return handleRPC(method, request) })
+}
+
+func recoverRPC(method string, fn func() ([]byte, int)) (out []byte, rc int) {
+	defer func() {
+		if p := recover(); p != nil {
+			logf("rpc %s panic（已拦截）: %v", method, p)
+			out, rc = errorEnvelope("plugin_panic", fmt.Sprintf("pggo 插件内部错误: %v", p), http.StatusInternalServerError), 1
+		}
+	}()
+	return fn()
 }
 
 func handleRPC(method string, request []byte) (out []byte, rc int) {
@@ -444,8 +524,8 @@ func handleRPC(method string, request []byte) (out []byte, rc int) {
 	case "plugin.quiesce":
 		// CPA 热更新时先对旧实例调用（internal/pluginhost/host.go callQuiesceWithOutcome），
 		// 成功后才加载新实例并对其 plugin.register。c-shared 库不会被卸载，旧实例必须在此
-		// 同步交出端口，否则新实例绑定失败。若新实例加载失败，CPA 会对旧实例再调
-		// plugin.register 回滚，届时 ensureHub 重新拉起中枢。
+		// 同步交出端口，否则新实例绑定失败。若新实例加载失败，CPA 回滚时会对旧实例发
+		// plugin.reconfigure（callRegister 对已注册实例用 reconfigure），届时 ensureHub 重新拉起中枢。
 		stopHub("plugin quiescing")
 		logf("已静默：中枢端口已释放，WS 已以 1001 断开")
 		return okEnvelope(struct{}{}), 0
