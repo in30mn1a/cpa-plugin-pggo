@@ -56,8 +56,8 @@ func cliproxy_plugin_init(host *C.cliproxy_host_api, plugin *C.cliproxy_plugin_a
 	plugin.call = C.cliproxy_plugin_call_fn(C.cliproxyPluginCall)
 	plugin.free_buffer = C.cliproxy_plugin_free_fn(C.cliproxyPluginFree)
 	plugin.shutdown = C.cliproxy_plugin_shutdown_fn(C.cliproxyPluginShutdown)
-	_ = host       // 本插件不回调宿主，保持签名一致即可
-	onPluginInit() // 再次 init = 宿主重新启用驻留的库，按上次配置拉起中枢
+	_ = host                                       // 本插件不回调宿主，保持签名一致即可
+	recoverC("cliproxy_plugin_init", onPluginInit) // 再次 init = 宿主重新启用驻留的库，按上次配置拉起中枢
 	return 0
 }
 
@@ -90,7 +90,7 @@ func cliproxyPluginFree(ptr unsafe.Pointer, length C.size_t) {
 
 //export cliproxyPluginShutdown
 func cliproxyPluginShutdown() {
-	pluginShutdown()
+	recoverC("cliproxyPluginShutdown", pluginShutdown)
 }
 
 func writeCResponse(response *C.cliproxy_buffer, raw []byte) {

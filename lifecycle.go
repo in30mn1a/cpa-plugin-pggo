@@ -42,10 +42,13 @@ func activateHub(c pluginConfig) {
 }
 
 // quiesceHub 由 plugin.quiesce 调用：同步交出端口，并禁止业务 RPC 把中枢复活。
+// 从未收到配置的实例保持 idle：否则之后的再次 init 会凭默认配置启动中枢。
 func quiesceHub() {
 	lifecycleMu.Lock()
 	defer lifecycleMu.Unlock()
-	hubState.Store(hubQuiesced)
+	if hubState.Load() != hubIdle {
+		hubState.Store(hubQuiesced)
+	}
 	stopHub("plugin quiescing")
 }
 
@@ -65,17 +68,45 @@ func pluginShutdown() {
 // 拉起；再次 init 说明宿主在重新启用这份驻留的库，用最后一次的配置重新拉起中枢（若随后仍有
 // plugin.register，同地址时 ensureHub 只更新配置）。
 func onPluginInit() {
-	if pluginInits.Add(1) == 1 {
-		return
-	}
+	n := pluginInits.Add(1)
 	lifecycleMu.Lock()
 	defer lifecycleMu.Unlock()
-	switch hubState.Load() {
+	state := hubState.Load()
+	logf("cliproxy_plugin_init 第 %d 次（生命周期状态 %s）", n, hubStateName(state))
+	if n == 1 {
+		return
+	}
+	switch state {
 	case hubShutdown, hubQuiesced:
 		hubState.Store(hubActive)
 		logf("插件被宿主重新初始化：按上次配置重新拉起中枢")
 		ensureHub(currentConfig())
 	}
+}
+
+func hubStateName(s int32) string {
+	switch s {
+	case hubIdle:
+		return "idle"
+	case hubActive:
+		return "active"
+	case hubShutdown:
+		return "shutdown"
+	case hubQuiesced:
+		return "quiesced"
+	}
+	return "unknown"
+}
+
+// recoverC 用于没有 RPC 信封兜底的 C ABI 入口（init / shutdown）：本库跑在 CPA 进程内，
+// panic 会带走宿主，这里拦截并记录。
+func recoverC(name string, fn func()) {
+	defer func() {
+		if p := recover(); p != nil {
+			logf("%s panic（已拦截）: %v", name, p)
+		}
+	}()
+	fn()
 }
 
 // reviveIfShutdown 在业务 RPC 入口调用：常态下只有一次原子读，不加锁、不分配。
@@ -86,7 +117,7 @@ func reviveIfShutdown() {
 }
 
 // reviveHub 把被停用的中枢按上次配置重新拉起；并发调用只有一个真正执行。
-// 浏览器页面脚本与无头 worker 会自动重连（worker 退避最长 30s），无需人工干预。
+// 浏览器页面脚本与无头 worker 会自动重连（worker 会话结束后按退避重启浏览器），无需人工干预。
 func reviveHub() {
 	lifecycleMu.Lock()
 	defer lifecycleMu.Unlock()

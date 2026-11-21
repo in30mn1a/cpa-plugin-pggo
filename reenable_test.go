@@ -229,3 +229,48 @@ func TestConcurrentReviveSingleHub(t *testing.T) {
 	_, _ = handleRPC("model.route", routeOtherModel)
 	expectListening(t, addr, "收尾 model.route 后")
 }
+
+// 降级/回滚：被静默替换的旧实例被宿主重新加载（同一句柄再次 init）时，按上次配置拉起中枢。
+func TestReinitRevivesQuiescedInstance(t *testing.T) {
+	resetLifecycle(t)
+	addr := freeAddr(t)
+	onPluginInit()
+	registerWith(t, "plugin.register", addr)
+	if _, rc := handleRPC("plugin.quiesce", []byte("{}")); rc != 0 {
+		t.Fatal("plugin.quiesce 失败")
+	}
+	pluginShutdown() // 之后被宿主卸下：仍保持静默
+	expectStopped(t, addr, "quiesce+shutdown 后")
+
+	onPluginInit()
+	expectListening(t, addr, "重新加载（再次 init）后")
+	if hubState.Load() != hubActive {
+		t.Fatalf("再次 init 后状态应为 active，实为 %d", hubState.Load())
+	}
+}
+
+// 从未收到配置的实例被静默后再 init：不得凭默认配置（:8788）启动中枢。
+func TestIdleQuiesceThenInitNoHub(t *testing.T) {
+	resetLifecycle(t)
+	onPluginInit()
+	if _, rc := handleRPC("plugin.quiesce", []byte("{}")); rc != 0 {
+		t.Fatal("plugin.quiesce 失败")
+	}
+	if hubState.Load() != hubIdle {
+		t.Fatalf("未配置实例被静默后应保持 idle，实为 %d", hubState.Load())
+	}
+	onPluginInit()
+	_, _ = handleRPC("model.route", routeOtherModel)
+	if activeHub() != nil || retrying() {
+		t.Fatal("未配置过的实例不应启动中枢")
+	}
+}
+
+// C ABI 入口的 panic 被拦截，不会冒到宿主。
+func TestRecoverCSwallowsPanic(t *testing.T) {
+	ran := false
+	recoverC("test", func() { ran = true; panic("boom") })
+	if !ran {
+		t.Fatal("fn 未执行")
+	}
+}
