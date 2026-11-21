@@ -250,7 +250,7 @@ func countIndent(s string) int {
 
 // ------------------------------------------------------------ 注册元数据 ----
 
-const pluginVersion = "1.1.1"
+const pluginVersion = "1.1.2"
 
 type configField struct {
 	Name        string   `json:"Name"`

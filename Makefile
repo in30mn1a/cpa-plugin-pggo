@@ -1,5 +1,5 @@
 PLUGIN  := pggo
-VERSION := 1.1.1
+VERSION := 1.1.2
 GOOS    ?= $(shell go env GOOS)
 GOARCH  ?= $(shell go env GOARCH)
 
